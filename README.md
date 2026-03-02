@@ -7,7 +7,7 @@ MCP server que permite interacturar con Odoo desde cualquier IDE compatible con 
 - 🔐 **Login con credenciales propias** - Cada usuario usa sus credenciales de Odoo
 - 📋 **Gestión de tareas** - Lista tus tareas, filtra por proyecto y estado
 - ⏱️ **Timesheets** - Carga horas trabajadas
-- � ramas GitLab** - Ver ramas asociadas a cada tarea
+- 🔀 **Ramas GitLab** - Ver ramas asociadas a cada tarea
 - 🔄 **Genérico** - Funciona con cualquier instancia de Odoo 17+
 
 ## Instalación
@@ -169,6 +169,16 @@ odoo_create_timesheet({
 #### Ver horas cargadas un día específico
 ```
 odoo_get_my_timesheets({ date: "2026-02-27" })
+```
+
+#### Ver horas cargadas en un rango de fechas
+```
+odoo_get_my_timesheets({ date_from: "2026-02-01", date_to: "2026-02-28" })
+```
+
+#### Ver horas de un proyecto específico
+```
+odoo_get_my_timesheets({ project_id: 7, date_from: "2026-02-01", date_to: "2026-02-28" })
 ```
 
 ## Configuración de Variables de Entorno
