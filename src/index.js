@@ -7,8 +7,8 @@ import {
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const DEFAULT_URL = process.env.ODOO_URL || "https://odoo.solunika.com";
-const DEFAULT_DB = process.env.ODOO_DB || "solunika";
+const DEFAULT_URL = process.env.ODOO_URL;
+const DEFAULT_DB = process.env.ODOO_DB;
 const SESSION_FILE =
   process.env.ODOO_SESSION_FILE ||
   `${process.env.HOME || ""}/.config/mcp-odoo/session.json`;
