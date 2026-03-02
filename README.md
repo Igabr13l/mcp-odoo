@@ -102,10 +102,14 @@ odoo_login({
 |-------------|-------------|
 | `odoo_whoami` | Muestra el usuario actual conectado |
 | `odoo_get_projects` | Lista todos los proyectos activos |
+| `odoo_get_my_projects` | Lista los proyectos donde tenés tickets asignados |
 | `odoo_get_my_tasks` | Lista tus tareas (opcional: project_id, state) |
+| `odoo_get_tickets` | Lista tickets con filtros (mine, project_id, state, search, limit) |
 | `odoo_get_task_detail` | Detalle de una tarea específica |
+| `odoo_update_task` | Edita asignados, descripción y estado/etapa de una tarea |
 | `odoo_get_task_gitlab_branches` | Ramas GitLab vinculadas a una tarea |
 | `odoo_create_timesheet` | Carga horas en una tarea |
+| `odoo_get_my_timesheets` | Lista tus horas cargadas con filtros por fecha/proyecto/tarea |
 
 ### 3. Ejemplos de uso
 
@@ -119,10 +123,32 @@ odoo_get_my_tasks({ state: "in_progress" })
 odoo_get_my_tasks({ project_id: 7, state: "in_progress" })
 ```
 
+#### Ver mis proyectos (donde tengo tickets)
+```
+odoo_get_my_projects({})
+```
+
+#### Ver tickets con filtros
+```
+odoo_get_tickets({ mine: true, state: "to_do", search: "whatsapp", limit: 50 })
+```
+
 #### Ver detalle de una tarea con ramas GitLab
 ```
 odoo_get_task_detail({ task_id: 9646 })
 ```
+
+#### Editar una tarea (asignados, descripción y estado)
+```
+odoo_update_task({
+  task_id: 9646,
+  assignee_user_ids: [16],
+  description: "Actualizar validaciones de WhatsApp",
+  state: "in_progress"
+})
+```
+
+También podés usar `stage_id` o `stage_name` en vez de `state`.
 
 #### Ver ramas GitLab de una tarea
 ```
@@ -138,6 +164,11 @@ odoo_create_timesheet({
   hours: 2,
   description: "Implementación de feature X"
 })
+```
+
+#### Ver horas cargadas un día específico
+```
+odoo_get_my_timesheets({ date: "2026-02-27" })
 ```
 
 ## Configuración de Variables de Entorno
