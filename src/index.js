@@ -179,6 +179,37 @@ function formatList(rows) {
   return rows.join('\n');
 }
 
+function buildTaskDomain({ uid, projectId, state, mine = true, search }) {
+  const domain = [];
+  if (mine) domain.push(['user_ids', '=', uid]);
+  if (projectId) domain.push(['project_id', '=', Number(projectId)]);
+  if (state === 'in_progress') domain.push(['stage_id.name', 'ilike', 'In Progress']);
+  if (state === 'to_do') domain.push(['stage_id.name', 'ilike', 'To Do']);
+  if (state === 'done') domain.push(['stage_id.name', 'ilike', 'Done']);
+  if (search) domain.push(['name', 'ilike', search.toString()]);
+  return domain;
+}
+
+async function resolveTaskStageId({ taskId, projectId, state, stageName }) {
+  const targetName = stageName || (state === 'in_progress' ? 'In Progress' : state === 'to_do' ? 'To Do' : state === 'done' ? 'Done' : null);
+  if (!targetName) return null;
+
+  const stages = await executeKw('project.task.type', 'search_read', [[['name', 'ilike', targetName]]], {
+    fields: ['id', 'name', 'project_ids'],
+    limit: 50,
+  });
+
+  if (!stages?.length) return null;
+
+  const projectStage = stages.find((s) => Array.isArray(s.project_ids) && s.project_ids.includes(projectId));
+  if (projectStage) return projectStage.id;
+
+  const globalStage = stages.find((s) => !s.project_ids || s.project_ids.length === 0);
+  if (globalStage) return globalStage.id;
+
+  return stages[0].id;
+}
+
 const server = new Server(
   { name: 'odoo-mcp', version: '2.0.0' },
   { capabilities: { tools: {} } }
@@ -222,6 +253,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: 'object', properties: {} },
     },
     {
+      name: 'odoo_get_my_projects',
+      description: 'List projects where I have assigned tasks',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
       name: 'odoo_get_my_tasks',
       description: 'List my tasks (optional filters: project_id, state)',
       inputSchema: {
@@ -233,12 +269,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'odoo_get_tickets',
+      description: 'List tickets/tasks with optional filters',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          mine: { type: 'boolean', description: 'Only my assigned tickets (default true)' },
+          project_id: { type: 'number', description: 'Project ID (optional)' },
+          state: { type: 'string', description: 'in_progress | to_do | done' },
+          search: { type: 'string', description: 'Search text in ticket name' },
+          limit: { type: 'number', description: 'Max results (default 100, max 500)' },
+        },
+      },
+    },
+    {
       name: 'odoo_get_task_detail',
       description: 'Get task details with assignees and metrics',
       inputSchema: {
         type: 'object',
         properties: {
           task_id: { type: 'number', description: 'Task ID' },
+        },
+        required: ['task_id'],
+      },
+    },
+    {
+      name: 'odoo_update_task',
+      description: 'Update task assignees, description, and status/stage',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'number', description: 'Task ID' },
+          assignee_user_ids: {
+            type: 'array',
+            description: 'Replace assignees with this list of user IDs',
+            items: { type: 'number' },
+          },
+          description: { type: 'string', description: 'Task description/body' },
+          stage_id: { type: 'number', description: 'Exact stage ID to set' },
+          stage_name: { type: 'string', description: 'Stage name (searched with ilike)' },
+          state: { type: 'string', description: 'Shortcut: in_progress | to_do | done' },
         },
         required: ['task_id'],
       },
@@ -327,6 +397,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           description: { type: 'string' },
         },
         required: ['task_id', 'project_id', 'date', 'hours', 'description'],
+      },
+    },
+    {
+      name: 'odoo_get_my_timesheets',
+      description: 'List my timesheet lines with optional filters',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          date: { type: 'string', description: 'Exact date YYYY-MM-DD' },
+          date_from: { type: 'string', description: 'From date YYYY-MM-DD' },
+          date_to: { type: 'string', description: 'To date YYYY-MM-DD' },
+          project_id: { type: 'number', description: 'Filter by project ID' },
+          task_id: { type: 'number', description: 'Filter by task ID' },
+          limit: { type: 'number', description: 'Max results (default 100, max 500)' },
+        },
       },
     },
     {
@@ -461,12 +546,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'odoo_get_my_projects': {
+        const tasks = await executeKw('project.task', 'search_read', [[['user_ids', '=', state.uid]]], {
+          fields: ['project_id'],
+          limit: 1000,
+        });
+
+        const seen = new Map();
+        for (const task of tasks || []) {
+          const projectId = task?.project_id?.[0];
+          const projectName = task?.project_id?.[1];
+          if (!projectId || !projectName || seen.has(projectId)) continue;
+          seen.set(projectId, projectName);
+        }
+
+        const list = [...seen.entries()]
+          .sort((a, b) => a[1].localeCompare(b[1]))
+          .map(([id, name]) => `[${id}] ${name}`);
+
+        return { content: [{ type: 'text', text: formatList(list) }] };
+      }
+
       case 'odoo_get_my_tasks': {
-        const domain = [['user_ids', '=', state.uid]];
-        if (args.project_id) domain.push(['project_id', '=', args.project_id]);
-        if (args.state === 'in_progress') domain.push(['stage_id.name', 'ilike', 'In Progress']);
-        if (args.state === 'to_do') domain.push(['stage_id.name', 'ilike', 'To Do']);
-        if (args.state === 'done') domain.push(['stage_id.name', 'ilike', 'Done']);
+        const domain = buildTaskDomain({ uid: state.uid, projectId: args.project_id, state: args.state, mine: true });
 
         const tasks = await executeKw('project.task', 'search_read', [domain], {
           fields: ['id', 'name', 'project_id', 'stage_id'],
@@ -486,6 +588,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case 'odoo_get_tickets': {
+        const mine = args.mine !== false;
+        const parsedLimit = Number(args.limit || 100);
+        const limit = Number.isNaN(parsedLimit) ? 100 : Math.max(1, Math.min(500, parsedLimit));
+        const domain = buildTaskDomain({
+          uid: state.uid,
+          projectId: args.project_id,
+          state: args.state,
+          mine,
+          search: args.search,
+        });
+
+        const tasks = await executeKw('project.task', 'search_read', [domain], {
+          fields: ['id', 'name', 'project_id', 'stage_id', 'priority', 'date_deadline'],
+          limit,
+          order: 'id desc',
+        });
+
+        const text = formatList(
+          tasks.map(
+            (t) =>
+              `[${t.id}] ${t.name}\n   ${t.project_id?.[1] || 'N/A'} - ${t.stage_id?.[1] || 'N/A'} - priority:${t.priority || '0'} - deadline:${t.date_deadline || 'N/A'}`
+          )
+        );
+
+        return { content: [{ type: 'text', text }] };
       }
 
       case 'odoo_get_task_detail': {
@@ -527,6 +657,82 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `Progress: ${t.progress || 0}%`,
           `Category: ${t.task_category || 'N/A'}`,
           `GitLab branch ids: ${t.gitlab_branch_ids?.join(', ') || 'none'}`,
+        ].join('\n');
+
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'odoo_update_task': {
+        const taskId = Number(args.task_id);
+        const values = {};
+
+        const currentRows = await executeKw('project.task', 'read', [[taskId], ['id', 'name', 'project_id', 'stage_id', 'user_ids', 'description']]);
+        if (!currentRows || currentRows.length === 0) {
+          return { content: [{ type: 'text', text: 'Task not found' }] };
+        }
+        const current = currentRows[0];
+        const projectId = current.project_id?.[0];
+
+        if (args.assignee_user_ids !== undefined) {
+          const assigneeIds = Array.isArray(args.assignee_user_ids)
+            ? args.assignee_user_ids.map((id) => Number(id)).filter((id) => !Number.isNaN(id))
+            : [];
+          values.user_ids = [[6, 0, assigneeIds]];
+        }
+
+        if (args.description !== undefined) {
+          values.description = args.description;
+        }
+
+        if (args.stage_id !== undefined) {
+          const stageId = Number(args.stage_id);
+          if (!Number.isNaN(stageId)) values.stage_id = stageId;
+        } else if (args.stage_name || args.state) {
+          const resolvedStageId = await resolveTaskStageId({
+            taskId,
+            projectId,
+            state: args.state,
+            stageName: args.stage_name,
+          });
+
+          if (!resolvedStageId) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `Could not resolve stage for state=${args.state || 'N/A'} stage_name=${args.stage_name || 'N/A'}`,
+                },
+              ],
+            };
+          }
+
+          values.stage_id = resolvedStageId;
+        }
+
+        if (Object.keys(values).length === 0) {
+          return { content: [{ type: 'text', text: 'Nothing to update' }] };
+        }
+
+        const ok = await executeKw('project.task', 'write', [[taskId], values]);
+        if (!ok) {
+          return { content: [{ type: 'text', text: 'Update failed' }] };
+        }
+
+        const updatedRows = await executeKw('project.task', 'read', [[taskId], ['id', 'name', 'project_id', 'stage_id', 'user_ids', 'description']]);
+        const updated = updatedRows?.[0];
+
+        let assignees = 'N/A';
+        if (updated?.user_ids?.length) {
+          const users = await executeKw('res.users', 'read', [updated.user_ids, ['name']]);
+          assignees = users.map((u) => u.name).join(', ');
+        }
+
+        const text = [
+          `Task updated: #${updated?.id || taskId} ${updated?.name || ''}`,
+          `Project: ${updated?.project_id?.[1] || 'N/A'}`,
+          `Stage: ${updated?.stage_id?.[1] || 'N/A'}`,
+          `Assignees: ${assignees}`,
+          `Description: ${updated?.description ? 'updated' : 'empty'}`,
         ].join('\n');
 
         return { content: [{ type: 'text', text }] };
@@ -730,6 +936,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ]);
 
         return { content: [{ type: 'text', text: `Timesheet created: ${timesheetId}` }] };
+      }
+
+      case 'odoo_get_my_timesheets': {
+        const parsedLimit = Number(args.limit || 100);
+        const limit = Number.isNaN(parsedLimit) ? 100 : Math.max(1, Math.min(500, parsedLimit));
+
+        const domain = [['user_id', '=', state.uid]];
+        if (args.date) {
+          domain.push(['date', '=', args.date]);
+        } else {
+          if (args.date_from) domain.push(['date', '>=', args.date_from]);
+          if (args.date_to) domain.push(['date', '<=', args.date_to]);
+        }
+        if (args.project_id) domain.push(['project_id', '=', Number(args.project_id)]);
+        if (args.task_id) domain.push(['task_id', '=', Number(args.task_id)]);
+
+        const rows = await executeKw('account.analytic.line', 'search_read', [domain], {
+          fields: ['id', 'date', 'unit_amount', 'name', 'project_id', 'task_id'],
+          limit,
+          order: 'date desc, id desc',
+        });
+
+        const totalHours = (rows || []).reduce((acc, row) => acc + (Number(row.unit_amount) || 0), 0);
+        const lines = (rows || []).map((r) => {
+          const project = r.project_id?.[1] || 'N/A';
+          const task = r.task_id?.[1] || 'N/A';
+          return `[${r.id}] ${r.date} - ${r.unit_amount || 0}h\n   ${project} / ${task}\n   ${r.name || ''}`;
+        });
+
+        const text = rows?.length
+          ? [`Total hours: ${totalHours}`, `Entries: ${rows.length}`, '', ...lines].join('\n')
+          : 'No results';
+
+        return { content: [{ type: 'text', text }] };
       }
 
       case 'odoo_update_timesheet': {
