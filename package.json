@@ -1,0 +1,12 @@
+{
+  "name": "mcp-odoo",
+  "version": "1.0.0",
+  "description": "MCP para conectar con Odoo - horas, tickets y proyectos",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
