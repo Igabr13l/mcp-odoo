@@ -1,9 +1,12 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 const DEFAULT_URL = process.env.ODOO_URL || 'https://odoo.solunika.com';
 const DEFAULT_DB = process.env.ODOO_DB || 'solunika';
+const SESSION_FILE = process.env.ODOO_SESSION_FILE || `${process.env.HOME || ''}/.config/mcp-odoo/session.json`;
 
 const state = {
   url: DEFAULT_URL,
@@ -12,6 +15,8 @@ const state = {
   login: null,
   password: null,
   name: null,
+  sessionLoaded: false,
+  sessionValidatedAt: 0,
 };
 
 async function callJsonRpc(payload) {
@@ -28,42 +33,135 @@ async function callJsonRpc(payload) {
   return data.result;
 }
 
-async function authenticate({ url, db, login, password }) {
+async function savePersistedSession() {
+  await mkdir(dirname(SESSION_FILE), { recursive: true });
+  const payload = {
+    url: state.url,
+    db: state.db,
+    uid: state.uid,
+    login: state.login,
+    password: state.password,
+    name: state.name,
+    saved_at: Date.now(),
+  };
+  await writeFile(SESSION_FILE, JSON.stringify(payload, null, 2), { mode: 0o600 });
+}
+
+async function loadPersistedSession() {
+  if (state.sessionLoaded) return;
+  state.sessionLoaded = true;
+
+  try {
+    const raw = await readFile(SESSION_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed?.login || !parsed?.password) return;
+
+    state.url = parsed.url || state.url;
+    state.db = parsed.db || state.db;
+    state.uid = parsed.uid || null;
+    state.login = parsed.login;
+    state.password = parsed.password;
+    state.name = parsed.name || null;
+  } catch {
+    // Ignore when no session file exists.
+  }
+}
+
+function clearInMemorySession() {
+  state.uid = null;
+  state.login = null;
+  state.password = null;
+  state.name = null;
+  state.sessionValidatedAt = 0;
+}
+
+async function clearPersistedSession() {
+  clearInMemorySession();
+  try {
+    await rm(SESSION_FILE, { force: true });
+  } catch {
+    // Ignore cleanup failures.
+  }
+}
+
+async function commonAuthenticate(url, db, login, password) {
+  const response = await fetch(`${url}/jsonrpc`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'call',
+      params: {
+        service: 'common',
+        method: 'authenticate',
+        args: [db, login, password, {}],
+      },
+      id: Date.now(),
+    }),
+  });
+
+  const data = await response.json();
+  if (data.error) {
+    throw new Error(data.error.data?.message || data.error.message || 'Odoo auth error');
+  }
+  return data.result || null;
+}
+
+async function ensureAuthenticated() {
+  if (state.login && state.password) {
+    const isFresh = Date.now() - state.sessionValidatedAt < 5 * 60 * 1000;
+    if (state.uid && isFresh) return;
+
+    const uid = await commonAuthenticate(state.url, state.db, state.login, state.password);
+    if (uid) {
+      state.uid = uid;
+      state.sessionValidatedAt = Date.now();
+      return;
+    }
+  }
+
+  await loadPersistedSession();
+  if (state.login && state.password) {
+    const uid = await commonAuthenticate(state.url, state.db, state.login, state.password);
+    if (!uid) {
+      await clearPersistedSession();
+      throw new Error('Stored session is no longer valid. Run odoo_login.');
+    }
+    state.uid = uid;
+    state.sessionValidatedAt = Date.now();
+    return;
+  }
+
+  throw new Error('Not authenticated. Run odoo_login first.');
+}
+
+async function authenticate({ url, db, login, password, remember = true }) {
   if (url) state.url = url.replace(/\/$/, '');
   if (db) state.db = db;
   state.login = login;
   state.password = password;
 
-  const uid = await callJsonRpc({
-    jsonrpc: '2.0',
-    method: 'call',
-    params: {
-      service: 'common',
-      method: 'authenticate',
-      args: [state.db, login, password, {}],
-    },
-    id: Date.now(),
-  });
+  const uid = await commonAuthenticate(state.url, state.db, login, password);
 
   if (!uid) {
     throw new Error('Authentication failed');
   }
 
   state.uid = uid;
+  state.sessionValidatedAt = Date.now();
 
   const user = await executeKw('res.users', 'read', [[uid], ['name', 'login']]);
   state.name = user?.[0]?.name || login;
+
+  if (remember !== false) {
+    await savePersistedSession();
+  }
+
   return { uid, name: state.name, login: user?.[0]?.login || login };
 }
 
-function assertAuthenticated() {
-  if (!state.uid || !state.login || !state.password) {
-    throw new Error('Not authenticated. Run odoo_login first.');
-  }
-}
-
 async function executeKw(model, method, args = [], kwargs = {}) {
-  assertAuthenticated();
+  await ensureAuthenticated();
   return callJsonRpc({
     jsonrpc: '2.0',
     method: 'call',
@@ -98,13 +196,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           db: { type: 'string', description: 'Database name' },
           login: { type: 'string', description: 'User login/email' },
           password: { type: 'string', description: 'User password' },
+          remember: { type: 'boolean', description: 'Persist session locally (default true)' },
         },
         required: ['login', 'password'],
       },
     },
     {
+      name: 'odoo_session_status',
+      description: 'Check if there is an active or stored session',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
       name: 'odoo_whoami',
       description: 'Show current authenticated user/session',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'odoo_logout',
+      description: 'Clear in-memory and persisted session',
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -143,6 +252,66 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           task_id: { type: 'number', description: 'Task ID' },
         },
         required: ['task_id'],
+      },
+    },
+    {
+      name: 'odoo_gitlab_list_projects',
+      description: 'Search GitLab repositories available in Odoo',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional search text' },
+          limit: { type: 'number', description: 'Optional limit (default 20)' },
+        },
+      },
+    },
+    {
+      name: 'odoo_gitlab_list_users',
+      description: 'Search Odoo users to assign as GitLab reviewer/owner',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional search text' },
+          limit: { type: 'number', description: 'Optional limit (default 20)' },
+        },
+      },
+    },
+    {
+      name: 'odoo_gitlab_add_task_branch',
+      description: 'Add a GitLab branch row to a task (same as tab GitLab -> add line)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'number', description: 'Task ID' },
+          gitlab_project_id: { type: 'number', description: 'GitLab project/repo ID from gitlab.project' },
+          reviewer_user_id: { type: 'number', description: 'Odoo user ID for gitlab_user_id (optional, default current user)' },
+          branch_name: { type: 'string', description: 'Branch name (optional, default odoo/<task_id>-<slug>)' },
+          from_branch: { type: 'string', description: 'Source branch (default uat)' },
+          target_branch: { type: 'string', description: 'Target branch (default uat)' },
+        },
+        required: ['task_id', 'gitlab_project_id'],
+      },
+    },
+    {
+      name: 'odoo_gitlab_create_branch',
+      description: 'Click "Create Branch" for a gitlab.task.branch row',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          gitlab_task_branch_id: { type: 'number', description: 'ID from gitlab.task.branch' },
+        },
+        required: ['gitlab_task_branch_id'],
+      },
+    },
+    {
+      name: 'odoo_gitlab_create_merge_request',
+      description: 'Click "Create Merge Request" for a gitlab.task.branch row',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          gitlab_task_branch_id: { type: 'number', description: 'ID from gitlab.task.branch' },
+        },
+        required: ['gitlab_task_branch_id'],
       },
     },
     {
@@ -218,6 +387,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
   try {
+    if (name !== 'odoo_login' && name !== 'odoo_session_status' && name !== 'odoo_logout') {
+      await ensureAuthenticated();
+    }
+
     switch (name) {
       case 'odoo_login': {
         const auth = await authenticate({
@@ -225,6 +398,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           db: args.db,
           login: args.login,
           password: args.password,
+          remember: args.remember,
         });
         return {
           content: [
@@ -236,8 +410,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'odoo_session_status': {
+        try {
+          await ensureAuthenticated();
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `active=true login=${state.login} uid=${state.uid} db=${state.db} url=${state.url}`,
+              },
+            ],
+          };
+        } catch {
+          await loadPersistedSession();
+          const hasStored = Boolean(state.login && state.password);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `active=false stored=${hasStored}`,
+              },
+            ],
+          };
+        }
+      }
+
       case 'odoo_whoami': {
-        assertAuthenticated();
         return {
           content: [
             {
@@ -246,6 +444,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case 'odoo_logout': {
+        await clearPersistedSession();
+        return { content: [{ type: 'text', text: 'Session cleared' }] };
       }
 
       case 'odoo_get_projects': {
@@ -367,6 +570,140 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           })
         );
 
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'odoo_gitlab_list_projects': {
+        const query = (args.query || '').toString();
+        const limit = Number(args.limit || 20);
+        const rows = await executeKw('gitlab.project', 'name_search', [query, [], 'ilike', limit]);
+        const text = formatList((rows || []).map((r) => `[${r[0]}] ${r[1]}`));
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'odoo_gitlab_list_users': {
+        const query = (args.query || '').toString();
+        const limit = Number(args.limit || 20);
+        const rows = await executeKw('res.users', 'name_search', [query, [], 'ilike', limit]);
+        const text = formatList((rows || []).map((r) => `[${r[0]}] ${r[1]}`));
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'odoo_gitlab_add_task_branch': {
+        const taskId = Number(args.task_id);
+        const gitlabProjectId = Number(args.gitlab_project_id);
+        const reviewerUserId = Number(args.reviewer_user_id || state.uid);
+        const fromBranch = (args.from_branch || 'uat').toString();
+        const targetBranch = (args.target_branch || 'uat').toString();
+
+        const task = await executeKw('project.task', 'read', [[taskId], ['id', 'name']]);
+        if (!task || task.length === 0) {
+          return { content: [{ type: 'text', text: 'Task not found' }] };
+        }
+
+        const fallbackSlug = task[0].name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/(^-|-$)/g, '')
+          .slice(0, 40);
+        const defaultBranchName = `odoo/${taskId}-${fallbackSlug || 'task'}`;
+        const branchName = (args.branch_name || defaultBranchName).toString();
+
+        const gitlabTaskBranchId = await executeKw('gitlab.task.branch', 'create', [
+          {
+            task_id: taskId,
+            gitlab_origin_project_id: gitlabProjectId,
+            from_branch: fromBranch,
+            gitlab_branch_name: branchName,
+            target_branch: targetBranch,
+            gitlab_user_id: reviewerUserId,
+          },
+        ]);
+
+        const created = await executeKw('gitlab.task.branch', 'read', [[gitlabTaskBranchId], [
+          'id',
+          'gitlab_origin_project_id',
+          'gitlab_branch_name',
+          'from_branch',
+          'target_branch',
+          'gitlab_user_id',
+          'gitlab_link',
+          'merge_request_link',
+        ]]);
+
+        const c = created?.[0];
+        const text = [
+          `GitLab task branch row created: ${c?.id || gitlabTaskBranchId}`,
+          `project: ${c?.gitlab_origin_project_id?.[1] || gitlabProjectId}`,
+          `branch: ${c?.gitlab_branch_name || branchName}`,
+          `from -> target: ${c?.from_branch || fromBranch} -> ${c?.target_branch || targetBranch}`,
+          `reviewer: ${c?.gitlab_user_id?.[1] || reviewerUserId}`,
+        ].join('\n');
+
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'odoo_gitlab_create_branch': {
+        const gitlabTaskBranchId = Number(args.gitlab_task_branch_id);
+        const currentRow = await executeKw('gitlab.task.branch', 'read', [[gitlabTaskBranchId], ['id', 'gitlab_branch_name']]);
+        const baseName = currentRow?.[0]?.gitlab_branch_name || `odoo/branch-${gitlabTaskBranchId}`;
+
+        let result = false;
+        let attempts = 0;
+        let renamed = false;
+        const maxAttempts = 8;
+
+        while (attempts < maxAttempts) {
+          try {
+            result = await executeKw('gitlab.task.branch', 'create_branch', [[gitlabTaskBranchId]], {});
+            break;
+          } catch (err) {
+            const msg = (err?.message || '').toLowerCase();
+            if (!msg.includes('branch already exists')) {
+              throw err;
+            }
+
+            attempts += 1;
+            renamed = true;
+            const suffix = attempts + 1;
+            let nextName = `${baseName}-${suffix}`;
+            if (nextName.length > 120) {
+              nextName = `${baseName.slice(0, 110)}-${suffix}`;
+            }
+
+            await executeKw('gitlab.task.branch', 'write', [[gitlabTaskBranchId], { gitlab_branch_name: nextName }]);
+          }
+        }
+
+        if (attempts >= maxAttempts && !result) {
+          throw new Error('Could not create branch after multiple retries (name collision).');
+        }
+
+        const row = await executeKw('gitlab.task.branch', 'read', [[gitlabTaskBranchId], ['id', 'gitlab_link', 'merge_request_link', 'gitlab_branch_name']]);
+        const r = row?.[0];
+        const text = [
+          `create_branch result: ${result}`,
+          `branch_id: ${gitlabTaskBranchId}`,
+          `renamed_on_conflict: ${renamed}`,
+          `retry_count: ${attempts}`,
+          `branch_name: ${r?.gitlab_branch_name || 'N/A'}`,
+          `gitlab_link: ${r?.gitlab_link || 'N/A'}`,
+        ].join('\n');
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'odoo_gitlab_create_merge_request': {
+        const gitlabTaskBranchId = Number(args.gitlab_task_branch_id);
+        const result = await executeKw('gitlab.task.branch', 'create_merge_request', [[gitlabTaskBranchId]], {});
+        const row = await executeKw('gitlab.task.branch', 'read', [[gitlabTaskBranchId], ['id', 'gitlab_link', 'merge_request_link', 'gitlab_branch_name']]);
+        const r = row?.[0];
+        const text = [
+          `create_merge_request result: ${result}`,
+          `branch_id: ${gitlabTaskBranchId}`,
+          `branch_name: ${r?.gitlab_branch_name || 'N/A'}`,
+          `gitlab_link: ${r?.gitlab_link || 'N/A'}`,
+          `merge_request_link: ${r?.merge_request_link || 'N/A'}`,
+        ].join('\n');
         return { content: [{ type: 'text', text }] };
       }
 
