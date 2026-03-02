@@ -160,6 +160,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['task_id', 'project_id', 'date', 'hours', 'description'],
       },
     },
+    {
+      name: 'odoo_update_timesheet',
+      description: 'Update an existing timesheet line',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          timesheet_id: { type: 'number' },
+          date: { type: 'string', description: 'YYYY-MM-DD (optional)' },
+          hours: { type: 'number', description: 'optional' },
+          description: { type: 'string', description: 'optional' },
+          task_id: { type: 'number', description: 'optional' },
+          project_id: { type: 'number', description: 'optional' },
+        },
+        required: ['timesheet_id'],
+      },
+    },
+    {
+      name: 'odoo_delete_timesheet',
+      description: 'Delete a timesheet line by ID',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          timesheet_id: { type: 'number' },
+        },
+        required: ['timesheet_id'],
+      },
+    },
+    {
+      name: 'odoo_create_timesheets_bulk',
+      description: 'Create many timesheet lines in one call',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          entries: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                task_id: { type: 'number' },
+                project_id: { type: 'number' },
+                date: { type: 'string', description: 'YYYY-MM-DD' },
+                hours: { type: 'number' },
+                description: { type: 'string' },
+              },
+              required: ['task_id', 'project_id', 'date', 'hours', 'description'],
+            },
+          },
+        },
+        required: ['entries'],
+      },
+    },
   ],
 }));
 
@@ -342,6 +393,102 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ]);
 
         return { content: [{ type: 'text', text: `Timesheet created: ${timesheetId}` }] };
+      }
+
+      case 'odoo_update_timesheet': {
+        const timesheetId = Number(args.timesheet_id);
+        const values = {};
+
+        if (args.date !== undefined) values.date = args.date;
+        if (args.hours !== undefined) values.unit_amount = args.hours;
+        if (args.description !== undefined) values.name = args.description;
+        if (args.task_id !== undefined) values.task_id = args.task_id;
+        if (args.project_id !== undefined) values.project_id = args.project_id;
+
+        if (Object.keys(values).length === 0) {
+          return { content: [{ type: 'text', text: 'Nothing to update' }] };
+        }
+
+        const ok = await executeKw('account.analytic.line', 'write', [[timesheetId], values]);
+        if (!ok) {
+          return { content: [{ type: 'text', text: 'Update failed' }] };
+        }
+
+        const updated = await executeKw('account.analytic.line', 'read', [[timesheetId], ['id', 'name', 'date', 'unit_amount', 'project_id', 'task_id']]);
+        const row = updated?.[0];
+        return {
+          content: [
+            {
+              type: 'text',
+              text: row
+                ? `Timesheet updated: [${row.id}] ${row.date} ${row.unit_amount}h ${row.name}`
+                : `Timesheet updated: ${timesheetId}`,
+            },
+          ],
+        };
+      }
+
+      case 'odoo_delete_timesheet': {
+        const timesheetId = Number(args.timesheet_id);
+        const ok = await executeKw('account.analytic.line', 'unlink', [[timesheetId]]);
+        return {
+          content: [{ type: 'text', text: ok ? `Timesheet deleted: ${timesheetId}` : 'Delete failed' }],
+        };
+      }
+
+      case 'odoo_create_timesheets_bulk': {
+        const entries = Array.isArray(args.entries) ? args.entries : [];
+        if (entries.length === 0) {
+          return { content: [{ type: 'text', text: 'No entries provided' }] };
+        }
+
+        const employees = await executeKw('hr.employee', 'search_read', [[['user_id', '=', state.uid]]], {
+          fields: ['id'],
+          limit: 1,
+        });
+
+        if (!employees?.length) {
+          return { content: [{ type: 'text', text: 'No employee found for current user' }] };
+        }
+
+        const employeeId = employees[0].id;
+        const createdIds = [];
+        const failed = [];
+
+        for (let i = 0; i < entries.length; i += 1) {
+          const e = entries[i];
+          try {
+            const id = await executeKw('account.analytic.line', 'create', [
+              {
+                date: e.date,
+                employee_id: employeeId,
+                project_id: e.project_id,
+                task_id: e.task_id,
+                name: e.description,
+                unit_amount: e.hours,
+                user_id: state.uid,
+              },
+            ]);
+            createdIds.push(id);
+          } catch (err) {
+            failed.push({ index: i, message: err.message });
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: [
+                `Bulk create finished`,
+                `Created: ${createdIds.length}`,
+                `IDs: ${createdIds.join(', ') || 'none'}`,
+                `Failed: ${failed.length}`,
+                ...failed.map((f) => `- entry ${f.index}: ${f.message}`),
+              ].join('\n'),
+            },
+          ],
+        };
       }
 
       default:
