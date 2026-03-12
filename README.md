@@ -6,6 +6,7 @@ MCP server que permite interacturar con Odoo desde cualquier IDE compatible con 
 
 - 🔐 **Login con credenciales propias** - Cada usuario usa sus credenciales de Odoo
 - 📋 **Gestión de tareas** - Lista tus tareas, filtra por proyecto y estado
+- 🧾 **Detalle enriquecido** - Ve etiquetas, prioridad legible y descripcion de cada ticket
 - ⏱️ **Timesheets** - Carga horas trabajadas
 - 🔀 **Ramas GitLab** - Ver ramas asociadas a cada tarea
 - 🔄 **Genérico** - Funciona con cualquier instancia de Odoo 17+
@@ -104,8 +105,8 @@ odoo_login({
 | `odoo_get_projects` | Lista todos los proyectos activos |
 | `odoo_get_my_projects` | Lista los proyectos donde tenés tickets asignados |
 | `odoo_get_my_tasks` | Lista tus tareas (opcional: project_id, state) |
-| `odoo_get_tickets` | Lista tickets con filtros (mine, project_id, state, search, limit) |
-| `odoo_get_task_detail` | Detalle de una tarea específica |
+| `odoo_get_tickets` | Lista tickets con filtros (mine, project_id, state, search, limit), prioridad y etiquetas |
+| `odoo_get_task_detail` | Detalle de una tarea con asignados, etiquetas, prioridad, descripcion y metricas |
 | `odoo_update_task` | Edita asignados, descripción y estado/etapa de una tarea |
 | `odoo_get_task_gitlab_branches` | Ramas GitLab vinculadas a una tarea |
 | `odoo_create_timesheet` | Carga horas en una tarea |

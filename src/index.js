@@ -24,6 +24,14 @@ const state = {
   sessionValidatedAt: 0,
 };
 
+const fieldAvailabilityCache = new Map();
+const selectionCache = new Map();
+
+function clearMetadataCaches() {
+  fieldAvailabilityCache.clear();
+  selectionCache.clear();
+}
+
 async function callJsonRpc(payload) {
   const response = await fetch(`${state.url}/jsonrpc`, {
     method: "POST",
@@ -77,6 +85,7 @@ async function loadPersistedSession() {
 }
 
 function clearInMemorySession() {
+  clearMetadataCaches();
   state.uid = null;
   state.login = null;
   state.password = null;
@@ -159,6 +168,7 @@ async function ensureAuthenticated() {
 async function authenticate({ url, db, login, password, remember = true }) {
   if (url) state.url = url.replace(/\/$/, "");
   if (db) state.db = db;
+  clearMetadataCaches();
   state.login = login;
   state.password = password;
 
@@ -198,6 +208,113 @@ async function executeKw(model, method, args = [], kwargs = {}) {
 function formatList(rows) {
   if (!rows || rows.length === 0) return "No results";
   return rows.join("\n");
+}
+
+function hasValue(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+function decodeHtmlEntities(value) {
+  const namedEntities = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+  };
+
+  return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+    if (entity.startsWith("#x") || entity.startsWith("#X")) {
+      return String.fromCharCode(Number.parseInt(entity.slice(2), 16));
+    }
+
+    if (entity.startsWith("#")) {
+      return String.fromCharCode(Number.parseInt(entity.slice(1), 10));
+    }
+
+    return namedEntities[entity.toLowerCase()] || match;
+  });
+}
+
+function htmlToText(html) {
+  if (!hasValue(html)) return "";
+
+  const text = html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<li[^>]*>/gi, "- ")
+    .replace(/<\/(p|div|h[1-6]|li)>/gi, "\n")
+    .replace(/<\/(ul|ol)>/gi, "\n")
+    .replace(/<[^>]+>/g, "");
+
+  return decodeHtmlEntities(text)
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function getAvailableFields(model, fieldNames) {
+  const names = fieldNames.filter(Boolean);
+  const missingNames = names.filter(
+    (fieldName) => !fieldAvailabilityCache.has(`${model}:${fieldName}`),
+  );
+
+  if (missingNames.length > 0) {
+    const metadata = await executeKw(model, "fields_get", [missingNames], {
+      attributes: ["type"],
+    });
+
+    for (const fieldName of missingNames) {
+      fieldAvailabilityCache.set(`${model}:${fieldName}`, Boolean(metadata?.[fieldName]));
+    }
+  }
+
+  return names.filter((fieldName) => fieldAvailabilityCache.get(`${model}:${fieldName}`));
+}
+
+async function getSelectionLabelMap(model, fieldName) {
+  const cacheKey = `${model}:${fieldName}:selection`;
+  if (selectionCache.has(cacheKey)) {
+    return selectionCache.get(cacheKey);
+  }
+
+  const metadata = await executeKw(model, "fields_get", [[fieldName]], {
+    attributes: ["selection"],
+  });
+  const map = new Map(metadata?.[fieldName]?.selection || []);
+  selectionCache.set(cacheKey, map);
+  return map;
+}
+
+async function getNameMap(model, ids) {
+  const cleanIds = [...new Set((ids || []).map((id) => Number(id)).filter((id) => !Number.isNaN(id)))];
+  if (cleanIds.length === 0) return new Map();
+
+  const rows = await executeKw(model, "read", [cleanIds, ["name"]]);
+  return new Map(
+    (rows || [])
+      .filter((row) => row?.id && hasValue(row?.name))
+      .map((row) => [row.id, row.name]),
+  );
+}
+
+function getNamesFromMap(ids, nameMap) {
+  return (ids || []).map((id) => nameMap.get(Number(id)) || `#${id}`);
+}
+
+function formatSelectionValue(selectionMap, value, fallback = "N/A") {
+  if (!hasValue(value)) return fallback;
+  return selectionMap.get(value) || value;
+}
+
+function formatTaskPriority(task, taskPriorityMap, priorityMap) {
+  if (hasValue(task?.task_priority)) {
+    return formatSelectionValue(taskPriorityMap, task.task_priority, task.task_priority);
+  }
+
+  return formatSelectionValue(priorityMap, task?.priority, "N/A");
 }
 
 function buildTaskDomain({ uid, projectId, state, mine = true, search }) {
@@ -315,7 +432,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "odoo_get_tickets",
-      description: "List tickets/tasks with optional filters",
+      description: "List tickets/tasks with optional filters, priority and tags",
       inputSchema: {
         type: "object",
         properties: {
@@ -335,7 +452,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "odoo_get_task_detail",
-      description: "Get task details with assignees and metrics",
+      description:
+        "Get task details with assignees, tags, priority, description and metrics",
       inputSchema: {
         type: "object",
         properties: {
@@ -718,23 +836,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           search: args.search,
         });
 
+        const ticketFields = await getAvailableFields("project.task", [
+          "id",
+          "name",
+          "project_id",
+          "stage_id",
+          "priority",
+          "task_priority",
+          "tag_ids",
+          "date_deadline",
+        ]);
+
         const tasks = await executeKw("project.task", "search_read", [domain], {
-          fields: [
-            "id",
-            "name",
-            "project_id",
-            "stage_id",
-            "priority",
-            "date_deadline",
-          ],
+          fields: ticketFields,
           limit,
           order: "id desc",
         });
 
+        const priorityMap = ticketFields.includes("priority")
+          ? await getSelectionLabelMap("project.task", "priority")
+          : new Map();
+        const taskPriorityMap = ticketFields.includes("task_priority")
+          ? await getSelectionLabelMap("project.task", "task_priority")
+          : new Map();
+        const tagNameMap = ticketFields.includes("tag_ids")
+          ? await getNameMap(
+              "project.tags",
+              tasks.flatMap((task) => task.tag_ids || []),
+            )
+          : new Map();
+
         const text = formatList(
           tasks.map(
-            (t) =>
-              `[${t.id}] ${t.name}\n   ${t.project_id?.[1] || "N/A"} - ${t.stage_id?.[1] || "N/A"} - priority:${t.priority || "0"} - deadline:${t.date_deadline || "N/A"}`,
+            (t) => {
+              const tagNames = getNamesFromMap(t.tag_ids, tagNameMap);
+              const priority = formatTaskPriority(
+                t,
+                taskPriorityMap,
+                priorityMap,
+              );
+
+              return `[${t.id}] ${t.name}\n   ${t.project_id?.[1] || "N/A"} - ${t.stage_id?.[1] || "N/A"} - priority:${priority} - tags:${tagNames.join(", ") || "none"} - deadline:${t.date_deadline || "N/A"}`;
+            },
           ),
         );
 
@@ -743,22 +886,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "odoo_get_task_detail": {
         const taskId = Number(args.task_id);
+        const taskFields = await getAvailableFields("project.task", [
+          "id",
+          "name",
+          "project_id",
+          "stage_id",
+          "user_ids",
+          "priority",
+          "task_priority",
+          "date_deadline",
+          "task_category",
+          "allocated_hours",
+          "effective_hours",
+          "progress",
+          "gitlab_branch_ids",
+          "tag_ids",
+          "description",
+        ]);
         const rows = await executeKw("project.task", "read", [
           [taskId],
-          [
-            "id",
-            "name",
-            "project_id",
-            "stage_id",
-            "user_ids",
-            "priority",
-            "date_deadline",
-            "task_category",
-            "allocated_hours",
-            "effective_hours",
-            "progress",
-            "gitlab_branch_ids",
-          ],
+          taskFields,
         ]);
 
         if (!rows || rows.length === 0) {
@@ -766,26 +913,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const t = rows[0];
-        let assignees = "N/A";
-        if (t.user_ids?.length) {
-          const users = await executeKw("res.users", "read", [
-            t.user_ids,
-            ["name"],
-          ]);
-          assignees = users.map((u) => u.name).join(", ");
-        }
+        const userNameMap = await getNameMap("res.users", t.user_ids || []);
+        const assignees = getNamesFromMap(t.user_ids, userNameMap).join(", ") || "N/A";
+        const tagNameMap = await getNameMap("project.tags", t.tag_ids || []);
+        const tags = getNamesFromMap(t.tag_ids, tagNameMap).join(", ") || "none";
+        const priorityMap = taskFields.includes("priority")
+          ? await getSelectionLabelMap("project.task", "priority")
+          : new Map();
+        const taskPriorityMap = taskFields.includes("task_priority")
+          ? await getSelectionLabelMap("project.task", "task_priority")
+          : new Map();
+        const categoryMap = taskFields.includes("task_category")
+          ? await getSelectionLabelMap("project.task", "task_category")
+          : new Map();
+        const description = htmlToText(t.description);
 
         const text = [
           `Task #${t.id}: ${t.name}`,
           `Project: ${t.project_id?.[1] || "N/A"}`,
           `Stage: ${t.stage_id?.[1] || "N/A"}`,
           `Assignees: ${assignees}`,
-          `Priority: ${t.priority}`,
+          `Tags: ${tags}`,
+          `Priority: ${formatTaskPriority(t, taskPriorityMap, priorityMap)}`,
           `Deadline: ${t.date_deadline || "N/A"}`,
           `Hours: ${t.effective_hours || 0}/${t.allocated_hours || 0}`,
           `Progress: ${t.progress || 0}%`,
-          `Category: ${t.task_category || "N/A"}`,
+          `Category: ${formatSelectionValue(categoryMap, t.task_category)}`,
           `GitLab branch ids: ${t.gitlab_branch_ids?.join(", ") || "none"}`,
+          "",
+          "Description:",
+          description || "N/A",
         ].join("\n");
 
         return { content: [{ type: "text", text }] };
