@@ -107,6 +107,12 @@ odoo_login({
 | `odoo_get_my_tasks` | Lista tus tareas (opcional: project_id, state) |
 | `odoo_get_tickets` | Lista tickets con filtros (mine, project_id, state, search, limit), prioridad y etiquetas |
 | `odoo_get_task_detail` | Detalle de una tarea con asignados, etiquetas, prioridad, descripcion y metricas |
+| `odoo_get_ticket_messages` | Lee mensajes y notas internas del chatter; oculta secretos por defecto |
+| `odoo_get_ticket_attachments` | Lista adjuntos, imágenes y videos con sus metadatos |
+| `odoo_get_ticket_images` | Devuelve imágenes adjuntas como contenido visual MCP |
+| `odoo_get_ticket_video_frames` | Extrae fotogramas representativos de videos adjuntos |
+| `odoo_get_my_board` | Tablero personal agrupado por etapas reales de Odoo |
+| `odoo_get_gitlab_status` | Verifica ramas y referencias de MR directamente en GitLab |
 | `odoo_update_task` | Edita asignados, descripción y estado/etapa de una tarea |
 | `odoo_get_task_gitlab_branches` | Ramas GitLab vinculadas a una tarea |
 | `odoo_create_timesheet` | Carga horas en una tarea |
@@ -138,6 +144,32 @@ odoo_get_tickets({ mine: true, state: "to_do", search: "whatsapp", limit: 50 })
 ```
 odoo_get_task_detail({ task_id: 9646 })
 ```
+
+#### Leer mensajes, notas y adjuntos
+```
+odoo_get_ticket_messages({ task_id: 9646, include_system: false })
+odoo_get_ticket_attachments({ task_id: 9646 })
+odoo_get_ticket_images({ task_id: 9646, limit: 5 })
+odoo_get_ticket_video_frames({ task_id: 9646, frames: 4 })
+```
+
+Los videos se listan con nombre, tipo MIME, tamaño y URL cuando Odoo guarda una.
+MCP no define contenido de video nativo, por lo que el servidor no carga el binario
+del video en el contexto. API keys, tokens y passwords se enmascaran por defecto en
+descripciones y mensajes.
+
+La extracción de fotogramas requiere `ffmpeg` y `ffprobe` instalados localmente.
+
+#### Ver tablero y estado GitLab
+```
+odoo_get_my_board({ project_id: 7 })
+odoo_get_gitlab_status({ task_id: 11244 })
+```
+
+La creación de una fila GitLab, una rama o un merge request requiere
+`confirm: true`. Las operaciones son idempotentes cuando Odoo ya tiene el
+recurso registrado. El MCP crea merge requests, pero no los fusiona: el merge
+debe respetar pipelines, conflictos y aprobaciones de GitLab.
 
 #### Editar una tarea (asignados, descripción y estado)
 ```
@@ -192,6 +224,21 @@ export ODOO_DB="nombre_db"
 ```
 
 Pero seguís necesitando hacer login con tu usuario y password.
+
+La sesión es única por proceso y se reutiliza durante toda la ejecución. El MCP
+no reautentica periódicamente: Odoo valida las credenciales en cada operación
+`execute_kw`. Si varias herramientas arrancan al mismo tiempo sin un `uid`
+persistido, comparten un único intento de autenticación.
+
+El timeout HTTP por defecto es de 15 segundos. Puede configurarse entre 1 y 120
+segundos con `ODOO_REQUEST_TIMEOUT_MS`.
+
+La sesión persistida se guarda con permisos `0600` y contiene las credenciales
+necesarias para JSON-RPC. Puede cambiarse su ubicación con `ODOO_SESSION_FILE`.
+
+La verificación remota de GitLab permite `gitlab.solunika.com` por defecto. Para
+otras instalaciones, configurá una lista separada por comas en
+`ODOO_GITLAB_ALLOWED_HOSTS`.
 
 ## Licencia
 
