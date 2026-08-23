@@ -3,16 +3,81 @@ import { dirname } from "node:path";
 import { hasValue } from "../utils/format.js";
 
 const DEFAULT_TIMEOUT_MS = 15000;
+const DEFAULT_RETRY_BACKOFF_MS = 100;
+const READ_ONLY_METHODS = new Set([
+  "check_access_rights",
+  "check_access_rule",
+  "fields_get",
+  "get_metadata",
+  "get_view",
+  "get_views",
+  "name_get",
+  "name_search",
+  "read",
+  "read_group",
+  "search",
+  "search_count",
+  "search_fetch",
+  "search_read",
+  "web_read",
+  "web_search_read",
+]);
+
+export class OdooRequestError extends Error {
+  constructor(message, {
+    code,
+    retryable = false,
+    outcome = "failed",
+    verificationRequired = false,
+  }) {
+    super(message);
+    this.name = "OdooRequestError";
+    this.code = code;
+    this.retryable = retryable;
+    this.outcome = outcome;
+    this.verificationRequired = verificationRequired;
+  }
+}
 
 function requestTimeout(value) {
   return Math.max(1000, Math.min(120000, Number(value) || DEFAULT_TIMEOUT_MS));
 }
 
-export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) {
+function retryBackoff(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : DEFAULT_RETRY_BACKOFF_MS;
+}
+
+function rpcError(data, fallback) {
+  const message = data.error.data?.message || data.error.message || fallback;
+  const type = `${data.error.data?.name || ""} ${data.error.data?.exception_type || ""}`;
+  if (/accessdenied|authentication|sessionexpired/i.test(`${type} ${message}`)) {
+    return new OdooRequestError(message, { code: "AUTHENTICATION_ERROR" });
+  }
+  if (/validationerror|usererror|warning/i.test(type)) {
+    return new OdooRequestError(message, { code: "ODOO_VALIDATION_ERROR" });
+  }
+  return new OdooRequestError(message, { code: "ODOO_SERVER_ERROR" });
+}
+
+function sleep(ms) {
+  return ms ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
+
+export function createOdooClient({
+  env = process.env,
+  fetchImpl = fetch,
+  retryBackoffMs,
+} = {}) {
   const sessionFile =
     env.ODOO_SESSION_FILE ||
     `${env.HOME || ""}/.config/mcp-odoo/session.json`;
   const timeoutMs = requestTimeout(env.ODOO_REQUEST_TIMEOUT_MS);
+  const executeRetryBackoffMs = retryBackoff(
+    retryBackoffMs ?? env.ODOO_RETRY_BACKOFF_MS,
+  );
   const state = {
     url: env.ODOO_URL,
     db: env.ODOO_DB,
@@ -20,6 +85,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
     login: null,
     password: null,
     name: null,
+    verified: false,
     sessionLoaded: false,
   };
   const fieldAvailabilityCache = new Map();
@@ -44,21 +110,33 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
         signal: controller.signal,
       });
       if (!response.ok) {
-        throw new Error(`Odoo HTTP ${response.status} ${response.statusText}`);
+        throw new OdooRequestError(
+          `Odoo HTTP ${response.status} ${response.statusText}`,
+          {
+            code: "HTTP_ERROR",
+            retryable: response.status >= 500 || response.status === 429,
+          },
+        );
       }
       try {
         return await response.json();
       } catch {
-        throw new Error("Odoo returned an invalid JSON response");
+        throw new OdooRequestError("Odoo returned an invalid JSON response", {
+          code: "INVALID_JSON",
+        });
       }
     } catch (error) {
       if (error?.name === "AbortError") {
-        throw new Error(`Odoo request timed out after ${timeoutMs}ms`);
+        throw new OdooRequestError(
+          `Odoo request timed out after ${timeoutMs}ms`,
+          { code: "TIMEOUT", retryable: true },
+        );
       }
-      if (error?.message?.startsWith("Odoo ")) throw error;
+      if (error instanceof OdooRequestError) throw error;
       const cause = error?.cause?.code || error?.cause?.message;
-      throw new Error(
+      throw new OdooRequestError(
         `Odoo network error: ${error?.message || String(error)}${cause ? ` (${cause})` : ""}`,
+        { code: "NETWORK_ERROR", retryable: true },
       );
     } finally {
       clearTimeout(timeout);
@@ -68,9 +146,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
   async function callJsonRpc(payload) {
     const data = await postJsonRpc(state.url, payload);
     if (data.error) {
-      throw new Error(
-        data.error.data?.message || data.error.message || "Odoo Server Error",
-      );
+      throw rpcError(data, "Odoo Server Error");
     }
     return data.result;
   }
@@ -109,6 +185,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
           state.login = parsed.login;
           state.password = parsed.password;
           state.name = parsed.name || null;
+          state.verified = false;
         } catch {
           // A missing or malformed session is equivalent to no saved session.
         } finally {
@@ -127,6 +204,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
     state.login = null;
     state.password = null;
     state.name = null;
+    state.verified = false;
   }
 
   async function logout() {
@@ -147,9 +225,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
       id: Date.now(),
     });
     if (data.error) {
-      throw new Error(
-        data.error.data?.message || data.error.message || "Odoo auth error",
-      );
+      throw rpcError(data, "Odoo auth error");
     }
     return data.result || null;
   }
@@ -158,7 +234,9 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
     await loadPersistedSession();
     if (state.uid && state.login && state.password) return;
     if (!state.login || !state.password) {
-      throw new Error("Not authenticated. Run odoo_login first.");
+      throw new OdooRequestError("Not authenticated. Run odoo_login first.", {
+        code: "AUTHENTICATION_ERROR",
+      });
     }
     if (!authenticationPromise) {
       const generation = sessionGeneration;
@@ -174,9 +252,13 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
         }
         if (!uid) {
           await logout();
-          throw new Error("Stored session is no longer valid. Run odoo_login.");
+          throw new OdooRequestError(
+            "Stored session is no longer valid. Run odoo_login.",
+            { code: "AUTHENTICATION_ERROR" },
+          );
         }
         state.uid = uid;
+        state.verified = true;
       })().finally(() => {
         authenticationPromise = null;
       });
@@ -185,17 +267,51 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
   }
 
   async function executeKw(model, method, args = [], kwargs = {}) {
-    await ensureAuthenticated();
-    return callJsonRpc({
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        service: "object",
-        method: "execute_kw",
-        args: [state.db, state.uid, state.password, model, method, args, kwargs],
-      },
-      id: Date.now(),
-    });
+    try {
+      await ensureAuthenticated();
+      const generation = sessionGeneration;
+      const readOnly = READ_ONLY_METHODS.has(method);
+      const payload = {
+        jsonrpc: "2.0",
+        method: "call",
+        params: {
+          service: "object",
+          method: "execute_kw",
+          args: [state.db, state.uid, state.password, model, method, args, kwargs],
+        },
+        id: Date.now(),
+      };
+      try {
+        const result = await callJsonRpc(payload);
+        if (generation === sessionGeneration) state.verified = true;
+        return result;
+      } catch (error) {
+        const transportFailure =
+          error?.code === "NETWORK_ERROR" || error?.code === "TIMEOUT";
+        if (readOnly && transportFailure && error.retryable) {
+          await sleep(executeRetryBackoffMs);
+          const result = await callJsonRpc(payload);
+          if (generation === sessionGeneration) state.verified = true;
+          return result;
+        }
+        const uncertainTransportFailure =
+          transportFailure ||
+          error?.code === "HTTP_ERROR" ||
+          error?.code === "INVALID_JSON";
+        if (
+          !readOnly &&
+          uncertainTransportFailure &&
+          (error.retryable || error?.code === "INVALID_JSON")
+        ) {
+          error.outcome = "uncertain";
+          error.verificationRequired = true;
+        }
+        throw error;
+      }
+    } catch (error) {
+      if (error?.code === "AUTHENTICATION_ERROR") state.verified = false;
+      throw error;
+    }
   }
 
   async function authenticate({ url, db, login, password, remember = true }) {
@@ -208,7 +324,11 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
     if (generation !== sessionGeneration) {
       throw new Error("Authentication was cancelled by logout");
     }
-    if (!uid) throw new Error("Authentication failed");
+    if (!uid) {
+      throw new OdooRequestError("Authentication failed", {
+        code: "AUTHENTICATION_ERROR",
+      });
+    }
 
     clearMetadataCaches();
     Object.assign(state, {
@@ -217,6 +337,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
       login,
       password,
       uid,
+      verified: true,
     });
     const users = await executeKw("res.users", "read", [[uid], ["name", "login"]]);
     state.name = users?.[0]?.name || login;
@@ -232,6 +353,7 @@ export function createOdooClient({ env = process.env, fetchImpl = fetch } = {}) 
     return {
       active: Boolean(state.uid && state.login && state.password),
       stored: Boolean(state.login && state.password),
+      verified: state.verified,
       uid: state.uid,
       login: state.login,
       name: state.name,

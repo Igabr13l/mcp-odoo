@@ -184,6 +184,7 @@ test("odoo_gitlab_add_task_branch requires confirm, defaults reviewer and branch
   });
   assert.match(preview.content[0].text, /Preview only; no row created/);
   assert.match(preview.content[0].text, /branch: odoo\/123-feature-x/);
+  assert.equal(preview.structuredContent.result, "preview");
   assert.equal(fake.calls.some((call) => call.method === "create"), false);
 
   const created = await handlers.odoo_gitlab_add_task_branch({
@@ -193,6 +194,7 @@ test("odoo_gitlab_add_task_branch requires confirm, defaults reviewer and branch
   });
   assert.match(created.content[0].text, /GitLab task branch row created: 41/);
   assert.match(created.content[0].text, /reviewer: Gabriel/);
+  assert.equal(created.structuredContent.branch_id, 41);
 
   const createCall = fake.calls.find((call) => call.method === "create");
   assert.equal(createCall.args[0].task_id, 123);
@@ -220,6 +222,7 @@ test("odoo_gitlab_add_task_branch is idempotent for an existing matching row", a
   assert.match(result.content[0].text, /GitLab task branch row already exists: 11/);
   assert.match(result.content[0].text, /https:\/\/gitlab.example\/repo\/-\/tree\/odoo\/123-feature-x/);
   assert.equal(fake.calls.some((call) => call.method === "create"), false);
+  assert.equal(result.structuredContent.result, "already_exists");
 });
 
 test("odoo_gitlab_create_branch is idempotent and requires confirm", async (t) => {
@@ -239,6 +242,7 @@ test("odoo_gitlab_create_branch is idempotent and requires confirm", async (t) =
     confirm: true,
   });
   assert.match(recordedResult.content[0].text, /Branch already recorded/);
+  assert.equal(recordedResult.structuredContent.result, "already_exists");
   assert.equal(
     recorded.calls.some((call) => call.method === "create_branch"),
     false,
@@ -256,55 +260,14 @@ test("odoo_gitlab_create_branch is idempotent and requires confirm", async (t) =
   });
   assert.match(preview.content[0].text, /Preview only; no branch created/);
   assert.match(preview.content[0].text, /branch_name: odoo\/123-feature/);
+  assert.equal(preview.structuredContent.result, "preview");
   assert.equal(
     previewFake.calls.some((call) => call.method === "create_branch"),
     false,
   );
 });
 
-test("odoo_gitlab_create_branch retries with a suffix on collision and keeps the rename on success", async (t) => {
-  const row = makeBranchRow(7);
-  let branchCalls = 0;
-  const fake = makeFakeOdoo({
-    "gitlab.task.branch.read": () => [row],
-    "gitlab.task.branch.write": ({ args }) => {
-      Object.assign(row, args[1]);
-      return true;
-    },
-    "gitlab.task.branch.create_branch": () => {
-      branchCalls += 1;
-      if (branchCalls === 1) {
-        throw new Error("GitLab API Error: Branch already exists");
-      }
-      row.gitlab_link =
-        "https://gitlab.example/repo/-/tree/odoo/123-feature-2";
-      return true;
-    },
-  });
-  const { handlers } = createGitLabTools({
-    executeKw: fake.executeKw,
-    getUid: () => 16,
-  });
-  const result = await handlers.odoo_gitlab_create_branch({
-    gitlab_task_branch_id: 7,
-    confirm: true,
-  });
-  assert.match(result.content[0].text, /retry_count: 1/);
-  assert.match(result.content[0].text, /renamed_on_conflict: true/);
-  assert.match(
-    result.content[0].text,
-    /gitlab_link: https:\/\/gitlab.example\/repo\/-\/tree\/odoo\/123-feature-2/,
-  );
-  assert.equal(row.gitlab_branch_name, "odoo/123-feature-2");
-
-  const writes = fake.calls.filter((call) => call.method === "write");
-  assert.deepEqual(
-    writes.map((call) => call.args[1].gitlab_branch_name),
-    ["odoo/123-feature-2"],
-  );
-});
-
-test("odoo_gitlab_create_branch restores the original name on terminal collision", async (t) => {
+test("odoo_gitlab_create_branch preserves the row and proposes a separately confirmed name on collision", async (t) => {
   const row = makeBranchRow(7);
   const fake = makeFakeOdoo({
     "gitlab.task.branch.read": () => [row],
@@ -326,15 +289,16 @@ test("odoo_gitlab_create_branch restores the original name on terminal collision
         gitlab_task_branch_id: 7,
         confirm: true,
       }),
-    /name collision/,
+    /Proposed alternate: 'odoo\/123-feature-2'.*confirm separately/,
   );
   assert.equal(row.gitlab_branch_name, "odoo/123-feature");
 
   const writes = fake.calls.filter((call) => call.method === "write");
-  assert.equal(writes.length, 8);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].args[1].gitlab_branch_name, "odoo/123-feature");
   assert.equal(
-    writes[writes.length - 1].args[1].gitlab_branch_name,
-    "odoo/123-feature",
+    fake.calls.filter((call) => call.method === "create_branch").length,
+    1,
   );
 });
 
@@ -369,12 +333,21 @@ test("odoo_gitlab_create_merge_request guards, confirms and reports the result",
   const { handlers } = createGitLabTools({
     executeKw: fake.executeKw,
     getUid: () => 16,
+    inspectBranch: async () => ({
+      status: "branch_active",
+      ahead: 2,
+      behind: 1,
+      branch_has_changes: true,
+      branch_empty: false,
+    }),
   });
 
   const preview = await handlers.odoo_gitlab_create_merge_request({
     gitlab_task_branch_id: 7,
   });
   assert.match(preview.content[0].text, /Preview only; no merge request created/);
+  assert.match(preview.content[0].text, /ahead: 2/);
+  assert.equal(preview.structuredContent.divergence.behind, 1);
   assert.equal(
     fake.calls.some((call) => call.method === "create_merge_request"),
     false,
@@ -389,10 +362,86 @@ test("odoo_gitlab_create_merge_request guards, confirms and reports the result",
     created.content[0].text,
     /merge_request_link: https:\/\/gitlab.example\/repo\/-\/merge_requests\/9/,
   );
+  assert.equal(created.structuredContent.divergence.ahead, 2);
 
   const again = await handlers.odoo_gitlab_create_merge_request({
     gitlab_task_branch_id: 7,
     confirm: true,
   });
   assert.match(again.content[0].text, /Merge request already recorded/);
+});
+
+test("odoo_gitlab_create_merge_request rejects empty and unverifiable branches", async () => {
+  const branch = makeBranchRow(7, {
+    gitlab_link: "https://gitlab.example/repo/-/tree/odoo/123-feature",
+  });
+  const fake = makeFakeOdoo({
+    "gitlab.task.branch.read": () => [branch],
+  });
+  const emptyTools = createGitLabTools({
+    executeKw: fake.executeKw,
+    inspectBranch: async () => ({
+      status: "branch_empty",
+      ahead: 0,
+      behind: 3,
+      branch_has_changes: false,
+      branch_empty: true,
+    }),
+  });
+  await assert.rejects(
+    () =>
+      emptyTools.handlers.odoo_gitlab_create_merge_request({
+        gitlab_task_branch_id: 7,
+        confirm: true,
+      }),
+    /empty branch \(ahead: 0, behind: 3\)/,
+  );
+
+  const failedTools = createGitLabTools({
+    executeKw: fake.executeKw,
+    inspectBranch: async () => {
+      throw new Error("network unavailable");
+    },
+  });
+  await assert.rejects(
+    () =>
+      failedTools.handlers.odoo_gitlab_create_merge_request({
+        gitlab_task_branch_id: 7,
+        confirm: true,
+      }),
+    /Unable to verify branch divergence: network unavailable/,
+  );
+  assert.equal(
+    fake.calls.some((call) => call.method === "create_merge_request"),
+    false,
+  );
+});
+
+test("odoo_gitlab_create_merge_request ignores boolean MR values after normalization", async () => {
+  const branch = makeBranchRow(7, {
+    gitlab_link: "https://gitlab.example/repo/-/tree/odoo/123-feature",
+    merge_request_link: true,
+  });
+  const fake = makeFakeOdoo({
+    "gitlab.task.branch.read": () => [branch],
+    "gitlab.task.branch.create_merge_request": () => {
+      branch.merge_request_link = "https://gitlab.example/repo/-/merge_requests/10";
+      return true;
+    },
+  });
+  const { handlers } = createGitLabTools({
+    executeKw: fake.executeKw,
+    inspectBranch: async () => ({
+      status: "branch_active",
+      ahead: 1,
+      behind: 0,
+      branch_has_changes: true,
+      branch_empty: false,
+    }),
+  });
+  const result = await handlers.odoo_gitlab_create_merge_request({
+    gitlab_task_branch_id: 7,
+    confirm: true,
+  });
+  assert.equal(result.structuredContent.result, true);
 });

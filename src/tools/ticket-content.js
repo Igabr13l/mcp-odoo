@@ -55,7 +55,7 @@ function formatMessage(message, redact) {
   return `[${message.id}] ${message.date || "N/A"} - ${messageLabel(message)} - ${author}\n   ${safeBody || "(empty)"}${attachments}`;
 }
 
-async function getMessageRows(executeKw, taskId, { includeSystem, limit }) {
+export async function getMessageRows(executeKw, taskId, { includeSystem, limit }) {
   const domain = [
     ["model", "=", "project.task"],
     ["res_id", "=", taskId],
@@ -79,14 +79,14 @@ async function getMessageRows(executeKw, taskId, { includeSystem, limit }) {
   });
 }
 
-async function getAttachmentRows(executeKw, taskId) {
+export async function getAttachmentRows(executeKw, taskId) {
   const messages = await executeKw("mail.message", "search_read", [
     [
       ["model", "=", "project.task"],
       ["res_id", "=", taskId],
     ],
   ], {
-    fields: ["attachment_ids"],
+    fields: ["id", "date", "author_id", "email_from", "attachment_ids"],
     limit: 500,
   });
   const messageAttachmentIds = [
@@ -110,17 +110,67 @@ async function getAttachmentRows(executeKw, taskId) {
       ])
     : [];
 
+  const taskAttachmentIds = new Set(
+    taskAttachments.map((attachment) => attachment.id),
+  );
+  const sourceMessagesByAttachment = new Map();
+  for (const message of messages) {
+    for (const attachmentId of message.attachment_ids || []) {
+      if (!sourceMessagesByAttachment.has(attachmentId)) {
+        sourceMessagesByAttachment.set(attachmentId, []);
+      }
+      sourceMessagesByAttachment.get(attachmentId).push({
+        id: message.id,
+        date: message.date || null,
+        author: {
+          id: message.author_id?.[0] || null,
+          name: message.author_id?.[1] || message.email_from || "System",
+        },
+      });
+    }
+  }
+
   return [
     ...new Map(
       [...taskAttachments, ...messageAttachments].map((attachment) => [
         attachment.id,
-        attachment,
+        {
+          ...attachment,
+          provenance: {
+            task_direct: taskAttachmentIds.has(attachment.id),
+            source_messages: sourceMessagesByAttachment.get(attachment.id) || [],
+          },
+        },
       ]),
     ).values(),
   ];
 }
 
+function formatProvenance(attachment) {
+  const sources = attachment.provenance?.source_messages || [];
+  const parts = [];
+  if (attachment.provenance?.task_direct) parts.push("task-direct");
+  parts.push(
+    ...sources.map(
+      (message) =>
+        `message:${message.id} ${message.date || "N/A"} ${message.author.name}`,
+    ),
+  );
+  return parts.join("; ") || "unknown";
+}
+
+export function normalizeAttachmentMetadata(attachment) {
+  const { datas: _datas, ...metadata } = attachment;
+  return {
+    ...metadata,
+    name: redactSecrets(htmlToText(metadata.name)),
+    description: redactSecrets(htmlToText(metadata.description)),
+    url: redactSecrets(metadata.url),
+  };
+}
+
 function formatAttachment(attachment) {
+  const metadata = normalizeAttachmentMetadata(attachment);
   const kind = attachment.mimetype?.startsWith("image/")
     ? "image"
     : attachment.mimetype?.startsWith("video/")
@@ -128,10 +178,10 @@ function formatAttachment(attachment) {
       : "file";
   const size = Number(attachment.file_size || 0);
   const source =
-    attachment.type === "url" && attachment.url
-      ? ` url=${attachment.url}`
+    metadata.type === "url" && metadata.url
+      ? ` url=${metadata.url}`
       : "";
-  return `[${attachment.id}] ${attachment.name || "unnamed"} - ${kind} - ${attachment.mimetype || "unknown"} - ${size} bytes${source}`;
+  return `[${attachment.id}] ${metadata.name || "unnamed"} - ${kind} - ${attachment.mimetype || "unknown"} - ${size} bytes${source}\n   provenance: ${formatProvenance(attachment)}`;
 }
 
 function videoExtension(mimetype) {
@@ -308,6 +358,10 @@ export function createTicketContentTools({ executeKw }) {
               text: formatList(rows.map(formatAttachment)),
             },
           ],
+          structuredContent: {
+            task_id: taskIdFrom(args),
+            attachments: rows.map(normalizeAttachmentMetadata),
+          },
         };
       },
 
@@ -330,13 +384,20 @@ export function createTicketContentTools({ executeKw }) {
               ["id", "name", "mimetype", "file_size", "datas"],
             ])
           : [];
+        const metadataById = new Map(
+          eligible.map((attachment) => [attachment.id, attachment]),
+        );
         const content = [];
+        const images = [];
 
         for (const row of rows) {
           if (!row.datas) continue;
+          const metadata = metadataById.get(row.id);
+          const rowMetadata = normalizeAttachmentMetadata(row);
+          images.push(normalizeAttachmentMetadata(metadata || row));
           content.push({
             type: "text",
-            text: `Image [${row.id}] ${row.name || "unnamed"} (${row.file_size || 0} bytes)`,
+            text: `Image [${row.id}] ${rowMetadata.name || "unnamed"} (${row.file_size || 0} bytes)\n   provenance: ${formatProvenance(metadata || row)}`,
           });
           content.push({
             type: "image",
@@ -356,7 +417,10 @@ export function createTicketContentTools({ executeKw }) {
           content.push({ type: "text", text: "No readable images found" });
         }
 
-        return { content };
+        return {
+          content,
+          structuredContent: { task_id: taskIdFrom(args), images },
+        };
       },
 
       async odoo_get_ticket_video_frames(args) {
@@ -397,10 +461,11 @@ export function createTicketContentTools({ executeKw }) {
           row,
           normalizeLimit(args.frames, 4, 8),
         );
+        const rowMetadata = normalizeAttachmentMetadata(row);
         const content = [
           {
             type: "text",
-            text: `Video [${row.id}] ${row.name || "unnamed"} - ${rendered.duration.toFixed(2)}s. Frames are visual samples; audio is not transcribed.`,
+            text: `Video [${row.id}] ${rowMetadata.name || "unnamed"} - ${rendered.duration.toFixed(2)}s. Frames are visual samples; audio is not transcribed.\n   provenance: ${formatProvenance(video)}`,
           },
         ];
         for (const frame of rendered.frames) {
@@ -414,7 +479,15 @@ export function createTicketContentTools({ executeKw }) {
             mimeType: "image/jpeg",
           });
         }
-        return { content };
+        return {
+          content,
+          structuredContent: {
+            task_id: taskIdFrom(args),
+            video: normalizeAttachmentMetadata(video),
+            duration_seconds: rendered.duration,
+            frame_timestamps: rendered.frames.map((frame) => frame.timestamp),
+          },
+        };
       },
     },
   };

@@ -1,5 +1,9 @@
 import { formatList } from "../utils/format.js";
 import { normalizeLimit, positiveInt } from "../utils/args.js";
+import {
+  inspectGitLabBranch,
+  normalizeMergeRequestLink,
+} from "./gitlab-status.js";
 
 const BRANCH_FIELDS = [
   "id",
@@ -12,7 +16,6 @@ const BRANCH_FIELDS = [
   "gitlab_user_id",
 ];
 
-const MAX_BRANCH_ATTEMPTS = 8;
 const MAX_BRANCH_NAME_LENGTH = 120;
 
 async function readTaskBranches(executeKw, taskId) {
@@ -172,7 +175,11 @@ function definitions() {
   ];
 }
 
-export function createGitLabTools({ executeKw, getUid }) {
+export function createGitLabTools({
+  executeKw,
+  getUid,
+  inspectBranch = inspectGitLabBranch,
+}) {
   const currentUid = getUid || (() => null);
 
   return {
@@ -266,6 +273,11 @@ export function createGitLabTools({ executeKw, getUid }) {
                 text: `GitLab task branch row already exists: ${existing.id}\nbranch: ${existing.gitlab_branch_name}\nlink: ${existing.gitlab_link || "not created"}\nmr: ${existing.merge_request_link || "not created"}`,
               },
             ],
+            structuredContent: {
+              result: "already_exists",
+              branch_id: existing.id,
+              branch: existing,
+            },
           };
         }
 
@@ -277,6 +289,15 @@ export function createGitLabTools({ executeKw, getUid }) {
                 text: `Preview only; no row created.\nproject_id: ${gitlabProjectId}\nbranch: ${branchName}\nfrom -> target: ${fromBranch} -> ${targetBranch}\nassignee: ${reviewerUserId}\nRetry with confirm=true to create it.`,
               },
             ],
+            structuredContent: {
+              result: "preview",
+              task_id: taskId,
+              gitlab_project_id: gitlabProjectId,
+              branch_name: branchName,
+              from_branch: fromBranch,
+              target_branch: targetBranch,
+              reviewer_user_id: reviewerUserId,
+            },
           };
         }
 
@@ -308,7 +329,14 @@ export function createGitLabTools({ executeKw, getUid }) {
           `reviewer: ${c?.gitlab_user_id?.[1] || reviewerUserId}`,
         ].join("\n");
 
-        return { content: [{ type: "text", text }] };
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: {
+            result: "created",
+            branch_id: c?.id || gitlabTaskBranchId,
+            branch: c || null,
+          },
+        };
       },
 
       async odoo_gitlab_create_branch(args) {
@@ -325,6 +353,11 @@ export function createGitLabTools({ executeKw, getUid }) {
                 text: `Branch already recorded: ${currentRow.gitlab_branch_name}\n${currentRow.gitlab_link}`,
               },
             ],
+            structuredContent: {
+              result: "already_exists",
+              branch_id: gitlabTaskBranchId,
+              branch: currentRow,
+            },
           };
         }
         const baseName =
@@ -338,58 +371,39 @@ export function createGitLabTools({ executeKw, getUid }) {
                 text: `Preview only; no branch created.\nbranch_id: ${gitlabTaskBranchId}\nbranch_name: ${baseName}\nRetry with confirm=true to create it.`,
               },
             ],
+            structuredContent: {
+              result: "preview",
+              branch_id: gitlabTaskBranchId,
+              branch_name: baseName,
+            },
           };
         }
 
-        let result = false;
-        let attempts = 0;
-        let renamed = false;
-
-        while (attempts < MAX_BRANCH_ATTEMPTS) {
-          const suffix = attempts === 0 ? "" : `-${attempts + 1}`;
-          const candidateName = `${baseName.slice(0, MAX_BRANCH_NAME_LENGTH - suffix.length)}${suffix}`;
-          if (attempts > 0) {
-            renamed = true;
-            await executeKw("gitlab.task.branch", "write", [
-              [gitlabTaskBranchId],
-              { gitlab_branch_name: candidateName },
-            ]);
+        let result;
+        try {
+          result = await executeKw(
+            "gitlab.task.branch",
+            "create_branch",
+            [[gitlabTaskBranchId]],
+            {},
+          );
+        } catch (err) {
+          if (!(err?.message || "").toLowerCase().includes("branch already exists")) {
+            throw err;
           }
-          try {
-            result = await executeKw(
-              "gitlab.task.branch",
-              "create_branch",
-              [[gitlabTaskBranchId]],
-              {},
-            );
-            break;
-          } catch (err) {
-            const msg = (err?.message || "").toLowerCase();
-            if (!msg.includes("branch already exists")) {
-              if (renamed) {
-                await executeKw("gitlab.task.branch", "write", [
-                  [gitlabTaskBranchId],
-                  { gitlab_branch_name: baseName },
-                ]);
-              }
-              throw err;
-            }
-            attempts += 1;
-          }
+          await executeKw("gitlab.task.branch", "write", [
+            [gitlabTaskBranchId],
+            { gitlab_branch_name: baseName },
+          ]);
+          const suffix = "-2";
+          const proposedName = `${baseName.slice(0, MAX_BRANCH_NAME_LENGTH - suffix.length)}${suffix}`;
+          throw new Error(
+            `Branch '${baseName}' already exists. The Odoo row was preserved. Proposed alternate: '${proposedName}'. Update the row and confirm separately.`,
+          );
         }
 
         if (!result) {
-          if (renamed) {
-            await executeKw("gitlab.task.branch", "write", [
-              [gitlabTaskBranchId],
-              { gitlab_branch_name: baseName },
-            ]);
-          }
-          throw new Error(
-            attempts >= MAX_BRANCH_ATTEMPTS
-              ? "Could not create branch after multiple retries (name collision)."
-              : "Odoo did not create the GitLab branch",
-          );
+          throw new Error("Odoo did not create the GitLab branch");
         }
 
         const row = await readBranchRow(executeKw, gitlabTaskBranchId);
@@ -397,12 +411,17 @@ export function createGitLabTools({ executeKw, getUid }) {
         const text = [
           `create_branch result: ${result}`,
           `branch_id: ${gitlabTaskBranchId}`,
-          `renamed_on_conflict: ${renamed}`,
-          `retry_count: ${attempts}`,
           `branch_name: ${r.gitlab_branch_name || "N/A"}`,
           `gitlab_link: ${r.gitlab_link || "N/A"}`,
         ].join("\n");
-        return { content: [{ type: "text", text }] };
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: {
+            result,
+            branch_id: gitlabTaskBranchId,
+            branch: r,
+          },
+        };
       },
 
       async odoo_gitlab_create_merge_request(args) {
@@ -416,24 +435,56 @@ export function createGitLabTools({ executeKw, getUid }) {
             "Create the GitLab branch before creating a merge request",
           );
         }
-        if (current.merge_request_link) {
+        const existingMergeRequest = normalizeMergeRequestLink(
+          current.merge_request_link,
+        );
+        if (existingMergeRequest) {
           return {
             content: [
               {
                 type: "text",
-                text: `Merge request already recorded:\n${current.merge_request_link}`,
+                text: `Merge request already recorded:\n${existingMergeRequest}`,
               },
             ],
+            structuredContent: {
+              result: "already_exists",
+              branch_id: gitlabTaskBranchId,
+              merge_request_link: existingMergeRequest,
+            },
           };
+        }
+        let divergence;
+        try {
+          divergence = await inspectBranch(current);
+        } catch (error) {
+          throw new Error(`Unable to verify branch divergence: ${error.message}`);
+        }
+        if (divergence.status === "branch_empty" || divergence.branch_empty) {
+          throw new Error(
+            `Cannot create a merge request for an empty branch (ahead: ${divergence.ahead}, behind: ${divergence.behind})`,
+          );
+        }
+        if (
+          divergence.status !== "branch_active" ||
+          divergence.branch_has_changes !== true
+        ) {
+          throw new Error(
+            `Unable to verify a non-empty branch (status: ${divergence.status})`,
+          );
         }
         if (args.confirm !== true) {
           return {
             content: [
               {
                 type: "text",
-                text: `Preview only; no merge request created.\nbranch_id: ${gitlabTaskBranchId}\nbranch_name: ${current.gitlab_branch_name}\nRetry with confirm=true to create it.`,
+                text: `Preview only; no merge request created.\nbranch_id: ${gitlabTaskBranchId}\nbranch_name: ${current.gitlab_branch_name}\nahead: ${divergence.ahead}\nbehind: ${divergence.behind}\nRetry with confirm=true to create it.`,
               },
             ],
+            structuredContent: {
+              result: "preview",
+              branch_id: gitlabTaskBranchId,
+              divergence,
+            },
           };
         }
         const result = await executeKw(
@@ -453,7 +504,15 @@ export function createGitLabTools({ executeKw, getUid }) {
           `gitlab_link: ${r.gitlab_link || "N/A"}`,
           `merge_request_link: ${r.merge_request_link || "N/A"}`,
         ].join("\n");
-        return { content: [{ type: "text", text }] };
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: {
+            result,
+            branch_id: gitlabTaskBranchId,
+            divergence,
+            branch: r,
+          },
+        };
       },
     },
   };

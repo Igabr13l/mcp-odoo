@@ -17,7 +17,7 @@ export function decodeHtmlEntities(value) {
     nbsp: " ",
   };
 
-  return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+  return String(value).replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
     if (entity.startsWith("#x") || entity.startsWith("#X")) {
       return String.fromCharCode(Number.parseInt(entity.slice(2), 16));
     }
@@ -31,9 +31,9 @@ export function decodeHtmlEntities(value) {
 }
 
 export function htmlToText(html) {
-  if (!hasValue(html)) return "";
+  if (!hasValue(html) || html === false) return "";
 
-  const text = html
+  const text = String(html)
     .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<li[^>]*>/gi, "- ")
@@ -50,9 +50,9 @@ export function htmlToText(html) {
 }
 
 export function redactSecrets(value) {
-  if (!hasValue(value)) return "";
+  if (!hasValue(value) || value === false) return "";
 
-  return value
+  return String(value)
     .replace(
       /-----BEGIN [^-\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\n]+ PRIVATE KEY-----/gi,
       "[REDACTED PRIVATE KEY]",

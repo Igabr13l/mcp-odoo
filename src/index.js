@@ -12,6 +12,7 @@ import { createProjectTools } from "./tools/projects.js";
 import { createSessionTools } from "./tools/session.js";
 import { createTaskTools } from "./tools/tasks.js";
 import { createTicketContentTools } from "./tools/ticket-content.js";
+import { createTicketContextTools } from "./tools/ticket-context.js";
 import { createTimesheetTools } from "./tools/timesheets.js";
 
 const client = createOdooClient();
@@ -27,6 +28,7 @@ const toolGroups = [
   createProjectTools(dependencies),
   createTaskTools(dependencies),
   createTicketContentTools(dependencies),
+  createTicketContextTools(dependencies),
   createBoardTools(dependencies),
   createGitLabTools(dependencies),
   createGitLabStatusTools(dependencies),
@@ -52,7 +54,7 @@ function createToolRegistry(groups) {
 
 const registry = createToolRegistry(toolGroups);
 const server = new Server(
-  { name: "odoo-mcp", version: "2.0.0" },
+  { name: "odoo-mcp", version: "2.1.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -79,11 +81,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     return await handler(args);
   } catch (error) {
+    const errorDetails = {
+      code: error?.code || "UNEXPECTED_ERROR",
+      message: error?.message || String(error),
+      outcome: error?.outcome || "failed",
+      retryable: error?.retryable === true,
+      verification_required: error?.verificationRequired === true,
+    };
+    const verificationHint = errorDetails.verification_required
+      ? " Outcome is uncertain; verify the remote state before retrying."
+      : "";
     return {
       isError: true,
       content: [
-        { type: "text", text: `Error: ${error?.message || String(error)}` },
+        {
+          type: "text",
+          text: `Error [${errorDetails.code}]: ${errorDetails.message}.${verificationHint}`,
+        },
       ],
+      structuredContent: { error: errorDetails },
     };
   }
 });

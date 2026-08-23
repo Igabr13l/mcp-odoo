@@ -67,13 +67,24 @@ test("concurrent tool calls authenticate a persisted session only once", async (
 
   try {
     await client.connect(transport);
+    const initialStatus = await client.callTool({
+      name: "odoo_session_status",
+      arguments: {},
+    });
+    assert.equal(initialStatus.structuredContent.stored, true);
+    assert.equal(initialStatus.structuredContent.verified, false);
+    assert.equal(fakeOdoo.authenticationCount(), 0);
     const results = await Promise.all(
       Array.from({ length: 5 }, () =>
         client.callTool({ name: "odoo_get_my_projects", arguments: {} }),
       ),
     );
     assert.equal(results.every((result) => result.isError !== true), true);
-    await client.callTool({ name: "odoo_session_status", arguments: {} });
+    const verifiedStatus = await client.callTool({
+      name: "odoo_session_status",
+      arguments: {},
+    });
+    assert.equal(verifiedStatus.structuredContent.verified, true);
     assert.equal(fakeOdoo.authenticationCount(), 1);
     const taskCall = fakeOdoo
       .objectCalls()

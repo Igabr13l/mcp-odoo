@@ -42,3 +42,10 @@ test("htmlToText removes script and style contents", () => {
     "Visible",
   );
 });
+
+test("format helpers accept non-string Odoo values", () => {
+  assert.equal(htmlToText(false), "");
+  assert.equal(htmlToText(42), "42");
+  assert.equal(redactSecrets(false), "");
+  assert.equal(redactSecrets(42), "42");
+});

@@ -17,7 +17,7 @@ function definitions() {
     },
     {
       name: "odoo_session_status",
-      description: "Check if there is an active or stored session",
+      description: "Check if credentials are loaded, stored, and verified in this process",
       inputSchema: { type: "object", properties: {} },
     },
     {
@@ -46,16 +46,25 @@ export function createSessionTools(client) {
       },
       async odoo_session_status() {
         const session = await client.getSession();
-        const text = session.active
-          ? `active=true login=${session.login} uid=${session.uid} db=${session.db} url=${session.url}`
-          : `active=false stored=${session.stored}`;
-        return { content: [{ type: "text", text }] };
+        const text = `active=${session.active} stored=${session.stored} verified=${session.verified} login=${session.login || "none"} uid=${session.uid ?? "none"} db=${session.db || "none"} url=${session.url || "none"}`;
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: session,
+        };
       },
       async odoo_whoami() {
         await client.ensureAuthenticated();
+        const currentSession = await client.getSession();
+        const users = await client.executeKw(
+          "res.users",
+          "read",
+          [[currentSession.uid], ["name", "login"]],
+        );
         const session = await client.getSession();
+        const user = users?.[0] || {};
         return {
-          content: [{ type: "text", text: `Connected as ${session.name || session.login} (${session.login}) uid=${session.uid} db=${session.db} url=${session.url}` }],
+          content: [{ type: "text", text: `Connected as ${user.name || session.name || session.login} (${user.login || session.login}) uid=${session.uid} db=${session.db} url=${session.url} verified=${session.verified}` }],
+          structuredContent: session,
         };
       },
       async odoo_logout() {

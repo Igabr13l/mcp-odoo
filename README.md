@@ -5,10 +5,10 @@ MCP server que permite interacturar con Odoo desde cualquier IDE compatible con 
 ## Características
 
 - 🔐 **Login con credenciales propias** - Cada usuario usa sus credenciales de Odoo
-- 📋 **Gestión de tareas** - Lista tus tareas, filtra por proyecto y estado
-- 🧾 **Detalle enriquecido** - Ve etiquetas, prioridad legible y descripcion de cada ticket
-- ⏱️ **Timesheets** - Carga horas trabajadas
-- 🔀 **Ramas GitLab** - Ver ramas asociadas a cada tarea
+- **Gestión de tareas** - Lista tus tareas, filtra por proyecto y estado
+- **Contexto de tickets** - Reúne descripción, chatter, evidencia, ramas, etapas y horas
+- **Timesheets seguros** - Valida tarea, proyecto, duplicados y propiedad de líneas
+- **Ramas GitLab** - Verifica referencias y divergencia antes de crear un MR
 - 🔄 **Genérico** - Funciona con cualquier instancia de Odoo 17+
 
 ## Instalación
@@ -111,6 +111,9 @@ odoo_login({
 | `odoo_get_ticket_attachments` | Lista adjuntos, imágenes y videos con sus metadatos |
 | `odoo_get_ticket_images` | Devuelve imágenes adjuntas como contenido visual MCP |
 | `odoo_get_ticket_video_frames` | Extrae fotogramas representativos de videos adjuntos |
+| `odoo_get_ticket_context` | Devuelve contexto agregado del ticket en una llamada |
+| `odoo_get_project_stages` | Lista IDs y nombres exactos de todas las etapas del proyecto |
+| `odoo_add_ticket_note` | Previsualiza o publica una nota interna redactada con confirmación |
 | `odoo_get_my_board` | Tablero personal agrupado por etapas reales de Odoo |
 | `odoo_get_gitlab_status` | Verifica ramas y referencias de MR directamente en GitLab |
 | `odoo_update_task` | Edita asignados, descripción y estado/etapa de una tarea |
@@ -168,8 +171,9 @@ odoo_get_gitlab_status({ task_id: 11244 })
 
 La creación de una fila GitLab, una rama o un merge request requiere
 `confirm: true`. Las operaciones son idempotentes cuando Odoo ya tiene el
-recurso registrado. El MCP crea merge requests, pero no los fusiona: el merge
-debe respetar pipelines, conflictos y aprobaciones de GitLab.
+recurso registrado. Antes de crear un MR, el MCP obtiene la divergencia real y
+compara los árboles resultantes; rechaza ramas sin commits propios o cuyo árbol
+es idéntico al merge base. El MCP no fusiona MRs.
 
 #### Editar una tarea (asignados, descripción y estado)
 ```
@@ -198,6 +202,12 @@ odoo_create_timesheet({
   description: "Implementación de feature X"
 })
 ```
+
+Las altas y modificaciones de timesheets se serializan dentro de cada proceso
+MCP para que la verificación de duplicados y la escritura formen una única
+sección crítica. Esto no coordina procesos MCP distintos ni otros clientes de
+Odoo: la idempotencia entre procesos y a nivel servidor sigue siendo
+responsabilidad de Odoo.
 
 #### Ver horas cargadas un día específico
 ```
@@ -233,12 +243,29 @@ persistido, comparten un único intento de autenticación.
 El timeout HTTP por defecto es de 15 segundos. Puede configurarse entre 1 y 120
 segundos con `ODOO_REQUEST_TIMEOUT_MS`.
 
+Las lecturas con errores transitorios de red o timeout se reintentan una sola
+vez. Las escrituras nunca se reintentan automáticamente: si el transporte falla,
+el resultado se marca como incierto y requiere verificar Odoo antes de repetir.
+El backoff de lectura se configura con `ODOO_RETRY_BACKOFF_MS`.
+
 La sesión persistida se guarda con permisos `0600` y contiene las credenciales
 necesarias para JSON-RPC. Puede cambiarse su ubicación con `ODOO_SESSION_FILE`.
 
 La verificación remota de GitLab permite `gitlab.solunika.com` por defecto. Para
 otras instalaciones, configurá una lista separada por comas en
 `ODOO_GITLAB_ALLOWED_HOSTS`.
+
+Si `ODOO_GITLAB_TOKEN` está configurado, `odoo_get_gitlab_status` consulta la API
+v4 de GitLab con `PRIVATE-TOKEN` para informar estado, conflictos, pipelines y
+aprobaciones del merge request. Las redirecciones no se siguen para evitar enviar
+el token a otro origen, y el token nunca se incluye en la respuesta. El timeout
+de estas consultas es de 15 segundos y puede configurarse entre 1 y 120 segundos
+mediante `ODOO_GITLAB_API_TIMEOUT_MS`.
+
+La inspección Git informa divergencia, merge base, hashes de árbol y si el árbol
+de la rama difiere del merge base. Una rama solo se considera activa si tiene
+commits propios y un árbol resultante diferente. Cada comando usa un timeout de
+15 segundos, configurable mediante `ODOO_GIT_TIMEOUT_MS`.
 
 ## Licencia
 
