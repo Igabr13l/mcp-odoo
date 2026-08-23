@@ -3,8 +3,19 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createOdooClient } from "../src/odoo/client.js";
+import {
+  createOdooClient,
+  type OdooClient,
+} from "../src/odoo/client.js";
 import { createSessionTools } from "../src/tools/session.js";
+import { required } from "./helpers.js";
+
+interface JsonRpcPayload {
+  params: {
+    service: string;
+    args: unknown[];
+  };
+}
 
 test("session status distinguishes loaded credentials from verification", async () => {
   const session = {
@@ -17,9 +28,27 @@ test("session status distinguishes loaded credentials from verification", async 
     db: "test",
     url: "https://odoo.example",
   };
-  const tools = createSessionTools({ getSession: async () => session });
+  const client: Pick<
+    OdooClient,
+    "authenticate" | "ensureAuthenticated" | "executeKw" | "getSession" | "logout"
+  > = {
+    authenticate: async () => {
+      throw new Error("Unexpected authenticate call");
+    },
+    ensureAuthenticated: async () => {
+      throw new Error("Unexpected ensureAuthenticated call");
+    },
+    executeKw: async () => {
+      throw new Error("Unexpected executeKw call");
+    },
+    getSession: async () => session,
+    logout: async () => {
+      throw new Error("Unexpected logout call");
+    },
+  };
+  const tools = createSessionTools(client);
 
-  const result = await tools.handlers.odoo_session_status();
+  const result = await tools.handlers.odoo_session_status({});
 
   assert.match(result.content[0].text, /active=true stored=true verified=false/);
   assert.deepEqual(result.structuredContent, session);
@@ -36,11 +65,12 @@ test("whoami verifies a persisted session with a res.users read", async () => {
     password: "password",
     name: "Stored Name",
   }));
-  let requestPayload;
+  let requestPayload: JsonRpcPayload | undefined;
   const client = createOdooClient({
     env: { ODOO_SESSION_FILE: sessionFile },
     fetchImpl: async (_url, options) => {
-      requestPayload = JSON.parse(options.body);
+      assert.ok(options.body);
+      requestPayload = JSON.parse(options.body) as JsonRpcPayload;
       return {
         ok: true,
         status: 200,
@@ -53,10 +83,11 @@ test("whoami verifies a persisted session with a res.users read", async () => {
   });
 
   try {
-    const result = await createSessionTools(client).handlers.odoo_whoami();
+    const result = await createSessionTools(client).handlers.odoo_whoami({});
+    const payload = required(requestPayload);
 
-    assert.equal(requestPayload.params.service, "object");
-    assert.deepEqual(requestPayload.params.args.slice(3), [
+    assert.equal(payload.params.service, "object");
+    assert.deepEqual(payload.params.args.slice(3), [
       "res.users",
       "read",
       [[16], ["name", "login"]],

@@ -1,16 +1,51 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type {
+  ExecuteKwImplementation,
+  GetAvailableFields,
+  GetUid,
+  OdooArguments,
+  OdooKeywordArguments,
+  OdooRecord,
+} from "../src/contracts.js";
 import { createTimesheetTools } from "../src/tools/timesheets.js";
+import {
+  array,
+  deferred,
+  record,
+  required,
+} from "./helpers.js";
 
 const UID = 16;
 
-function makeExecuteKw(overrides = {}) {
-  const calls = [];
-  const executeKw = async (model, method, args = [], kwargs = {}) => {
+interface OdooCall {
+  key: string;
+  model: string;
+  method: string;
+  args: OdooArguments;
+  kwargs: OdooKeywordArguments;
+}
+
+type OdooOverride = (
+  args: OdooArguments,
+  kwargs: OdooKeywordArguments,
+  calls: OdooCall[],
+) => unknown | Promise<unknown>;
+type OdooOverrides = Record<string, OdooOverride>;
+type MockExecuteKw = ExecuteKwImplementation & { calls: OdooCall[] };
+
+function makeExecuteKw(overrides: OdooOverrides = {}): MockExecuteKw {
+  const calls: OdooCall[] = [];
+  const executeKw: ExecuteKwImplementation = async (
+    model,
+    method,
+    args = [],
+    kwargs = {},
+  ) => {
     const key = `${model}.${method}`;
     calls.push({ key, model, method, args, kwargs });
     if (Object.hasOwn(overrides, key)) {
-      return overrides[key](args, kwargs, calls);
+      return required(overrides[key])(args, kwargs, calls);
     }
     switch (key) {
       case "hr.employee.search_read":
@@ -39,18 +74,21 @@ function makeExecuteKw(overrides = {}) {
       case "account.analytic.line.search_count":
         return 0;
       case "project.task.search_read": {
-        const taskId = args[0][0][2];
+        const taskId = array(array(args[0])[0])[2];
         return [{ id: taskId, project_id: [7, "Project"] }];
       }
       default:
         return [];
     }
   };
-  executeKw.calls = calls;
-  return executeKw;
+  return Object.assign(executeKw, { calls });
 }
 
-function makeTools(executeKw, getUid = () => UID, getAvailableFields) {
+function makeTools(
+  executeKw: ExecuteKwImplementation,
+  getUid: GetUid = () => UID,
+  getAvailableFields?: GetAvailableFields,
+) {
   return createTimesheetTools({ executeKw, getUid, getAvailableFields });
 }
 
@@ -78,7 +116,7 @@ test("defines the five timesheet tools with preserved schemas", () => {
   const create = definitions.find(
     (definition) => definition.name === "odoo_create_timesheet",
   );
-  assert.deepEqual(create.inputSchema.required, [
+  assert.deepEqual(required(create).inputSchema.required, [
     "task_id",
     "project_id",
     "date",
@@ -89,22 +127,23 @@ test("defines the five timesheet tools with preserved schemas", () => {
   const update = definitions.find(
     (definition) => definition.name === "odoo_update_timesheet",
   );
-  assert.deepEqual(update.inputSchema.required, ["timesheet_id"]);
+  assert.deepEqual(required(update).inputSchema.required, ["timesheet_id"]);
 
   const list = definitions.find(
     (definition) => definition.name === "odoo_get_my_timesheets",
   );
-  assert.equal(list.inputSchema.properties.offset.type, "number");
+  const listProperties = record(required(list).inputSchema.properties);
+  assert.equal(record(listProperties.offset).type, "number");
 
   const deleteTool = definitions.find(
     (definition) => definition.name === "odoo_delete_timesheet",
   );
-  assert.deepEqual(deleteTool.inputSchema.required, ["timesheet_id"]);
+  assert.deepEqual(required(deleteTool).inputSchema.required, ["timesheet_id"]);
 
   const bulk = definitions.find(
     (definition) => definition.name === "odoo_create_timesheets_bulk",
   );
-  assert.deepEqual(bulk.inputSchema.required, ["entries"]);
+  assert.deepEqual(required(bulk).inputSchema.required, ["entries"]);
 });
 
 test("odoo_create_timesheet looks up the employee once and creates the line", async () => {
@@ -121,7 +160,7 @@ test("odoo_create_timesheet looks up the employee once and creates the line", as
   const createCall = executeKw.calls.find(
     (call) => call.key === "account.analytic.line.create",
   );
-  assert.deepEqual(createCall.args, [
+  assert.deepEqual(required(createCall).args, [
     {
       date: "2026-03-01",
       employee_id: 9,
@@ -212,25 +251,25 @@ test("odoo_create_timesheet trims descriptions and rejects normalized duplicates
   const createCall = cleanExecuteKw.calls.find(
     (call) => call.key === "account.analytic.line.create",
   );
-  assert.equal(createCall.args[0].name, "Implement feature");
+  assert.equal(record(required(createCall).args[0]).name, "Implement feature");
 });
 
 test("odoo_create_timesheet serializes concurrent duplicate checks and creates", async () => {
-  const rows = [];
-  let releaseFirstCreate;
-  let firstCreateStarted;
-  const createStarted = new Promise((resolve) => {
-    firstCreateStarted = resolve;
-  });
-  const createCanFinish = new Promise((resolve) => {
-    releaseFirstCreate = resolve;
-  });
+  const rows: OdooRecord[] = [];
+  const createStarted = deferred<void>();
+  const createCanFinish = deferred<void>();
   const executeKw = makeExecuteKw({
     "account.analytic.line.search_read": () => rows,
     "account.analytic.line.create": async (args) => {
-      firstCreateStarted();
-      await createCanFinish;
-      const row = { id: 77, name: args[0].name, unit_amount: args[0].unit_amount };
+      createStarted.resolve();
+      await createCanFinish.promise;
+      const values = record(args[0]);
+      const name = values.name;
+      const unitAmount = values.unit_amount;
+      if (typeof name !== "string" || typeof unitAmount !== "number") {
+        throw new TypeError("Unexpected timesheet fixture values");
+      }
+      const row = { id: 77, name, unit_amount: unitAmount };
       rows.push(row);
       return row.id;
     },
@@ -238,9 +277,9 @@ test("odoo_create_timesheet serializes concurrent duplicate checks and creates",
   const { handlers } = makeTools(executeKw);
 
   const first = handlers.odoo_create_timesheet(validEntry);
-  await createStarted;
+  await createStarted.promise;
   const second = handlers.odoo_create_timesheet(validEntry);
-  releaseFirstCreate();
+  createCanFinish.resolve();
   const results = await Promise.allSettled([first, second]);
 
   assert.equal(results[0].status, "fulfilled");
@@ -303,7 +342,7 @@ test("odoo_create_timesheet accepts fractional hours", async () => {
   const createCall = executeKw.calls.find(
     (call) => call.key === "account.analytic.line.create",
   );
-  assert.equal(createCall.args[0].unit_amount, 2.5);
+  assert.equal(record(required(createCall).args[0]).unit_amount, 2.5);
   assert.equal(result.content[0].text, "Timesheet created: 1001");
 });
 
@@ -343,13 +382,14 @@ test("odoo_get_my_timesheets filters by exact date and defaults limit to 100", a
   const call = executeKw.calls.find(
     (entry) => entry.key === "account.analytic.line.search_read",
   );
-  assert.deepEqual(call.args[0], [
+  const searchCall = required(call);
+  assert.deepEqual(searchCall.args[0], [
     ["user_id", "=", UID],
     ["date", "=", "2026-03-01"],
   ]);
-  assert.equal(call.kwargs.limit, 100);
-  assert.equal(call.kwargs.offset, 0);
-  assert.equal(call.kwargs.order, "date desc, id desc");
+  assert.equal(searchCall.kwargs.limit, 100);
+  assert.equal(searchCall.kwargs.offset, 0);
+  assert.equal(searchCall.kwargs.order, "date desc, id desc");
   assert.match(result.content[0].text, /Total hours: 5/);
   assert.match(result.content[0].text, /Entries: 2/);
   assert.equal(result.structuredContent.total_hours, 5);
@@ -378,8 +418,8 @@ test("odoo_get_my_timesheets paginates with a matching count domain", async () =
   const readCall = executeKw.calls.find(
     (call) => call.key === "account.analytic.line.search_read",
   );
-  assert.deepEqual(countCall.args, readCall.args);
-  assert.equal(readCall.kwargs.offset, 8);
+  assert.deepEqual(required(countCall).args, required(readCall).args);
+  assert.equal(required(readCall).kwargs.offset, 8);
   assert.match(result.content[0].text, /Total count: 12/);
   assert.match(result.content[0].text, /Offset: 8/);
   assert.match(result.content[0].text, /Has more: true/);
@@ -417,12 +457,12 @@ test("odoo_get_my_timesheets uses a date range and clamps limit to 500", async (
   const call = executeKw.calls.find(
     (entry) => entry.key === "account.analytic.line.search_read",
   );
-  assert.deepEqual(call.args[0], [
+  assert.deepEqual(required(call).args[0], [
     ["user_id", "=", UID],
     ["date", ">=", "2026-02-01"],
     ["date", "<=", "2026-02-28"],
   ]);
-  assert.equal(call.kwargs.limit, 500);
+  assert.equal(required(call).kwargs.limit, 500);
 });
 
 test("odoo_get_my_timesheets falls back to 100 when limit is not a number", async () => {
@@ -433,7 +473,7 @@ test("odoo_get_my_timesheets falls back to 100 when limit is not a number", asyn
   const call = executeKw.calls.find(
     (entry) => entry.key === "account.analytic.line.search_read",
   );
-  assert.equal(call.kwargs.limit, 100);
+  assert.equal(required(call).kwargs.limit, 100);
 });
 
 test("odoo_get_my_timesheets validates optional project and task filters", async () => {
@@ -444,7 +484,7 @@ test("odoo_get_my_timesheets validates optional project and task filters", async
   const call = executeKw.calls.find(
     (entry) => entry.key === "account.analytic.line.search_read",
   );
-  assert.deepEqual(call.args[0], [
+  assert.deepEqual(required(call).args[0], [
     ["user_id", "=", UID],
     ["project_id", "=", 7],
     ["task_id", "=", 8],
@@ -502,8 +542,8 @@ test("odoo_update_timesheet maps provided fields and returns a summary", async (
   const writeCall = executeKw.calls.find(
     (call) => call.key === "account.analytic.line.write",
   );
-  assert.deepEqual(writeCall.args[0], [5]);
-  assert.deepEqual(writeCall.args[1], {
+  assert.deepEqual(required(writeCall).args[0], [5]);
+  assert.deepEqual(required(writeCall).args[1], {
     date: "2026-03-02",
     unit_amount: 3.5,
     name: "Fixed bug",
@@ -603,7 +643,7 @@ test("odoo_update_timesheet validates the effective association and values", asy
 test("odoo_update_timesheet rejects an effective duplicate excluding itself", async () => {
   const executeKw = makeExecuteKw({
     "account.analytic.line.search_read": (args) => {
-      const domain = args[0];
+      const domain = array(args[0]);
       assert.deepEqual(domain, [
         ["user_id", "=", UID],
         ["date", "=", "2026-03-01"],
@@ -666,7 +706,7 @@ test("odoo_delete_timesheet unlinks the line and returns a summary", async () =>
   const call = executeKw.calls.find(
     (entry) => entry.key === "account.analytic.line.unlink",
   );
-  assert.deepEqual(call.args[0], [5]);
+  assert.deepEqual(required(call).args[0], [5]);
   assert.equal(result.content[0].text, "Timesheet deleted: 5");
   assert.deepEqual(result.structuredContent, { id: 5, deleted: true });
 });
@@ -683,32 +723,26 @@ test("odoo_delete_timesheet verifies ownership before unlinking", async () => {
 });
 
 test("odoo_delete_timesheet queues ownership verification and unlink together", async () => {
-  let releaseCreate;
-  let createStarted;
-  const createCanFinish = new Promise((resolve) => {
-    releaseCreate = resolve;
-  });
-  const createDidStart = new Promise((resolve) => {
-    createStarted = resolve;
-  });
+  const createCanFinish = deferred<void>();
+  const createDidStart = deferred<void>();
   const executeKw = makeExecuteKw({
     "account.analytic.line.create": async () => {
-      createStarted();
-      await createCanFinish;
+      createDidStart.resolve();
+      await createCanFinish.promise;
       return 77;
     },
   });
   const { handlers } = makeTools(executeKw);
 
   const create = handlers.odoo_create_timesheet(validEntry);
-  await createDidStart;
+  await createDidStart.promise;
   const remove = handlers.odoo_delete_timesheet({ timesheet_id: 5 });
 
   assert.equal(
     executeKw.calls.some((call) => call.key === "account.analytic.line.read"),
     false,
   );
-  releaseCreate();
+  createCanFinish.resolve();
   await Promise.all([create, remove]);
 
   const mutationCalls = executeKw.calls
@@ -762,10 +796,10 @@ test("odoo_create_timesheets_bulk creates every entry with a single employee loo
     (call) => call.key === "account.analytic.line.create",
   );
   assert.equal(createCalls.length, 2);
-  assert.equal(createCalls[0].args[0].date, "2026-03-01");
-  assert.equal(createCalls[0].args[0].employee_id, 9);
-  assert.equal(createCalls[0].args[0].user_id, UID);
-  assert.equal(createCalls[1].args[0].date, "2026-03-02");
+  assert.equal(record(createCalls[0].args[0]).date, "2026-03-01");
+  assert.equal(record(createCalls[0].args[0]).employee_id, 9);
+  assert.equal(record(createCalls[0].args[0]).user_id, UID);
+  assert.equal(record(createCalls[1].args[0]).date, "2026-03-02");
 
   assert.match(result.content[0].text, /Bulk create finished/);
   assert.match(result.content[0].text, /Created: 2/);
@@ -816,8 +850,9 @@ test("odoo_create_timesheets_bulk rejects empty or oversized entry lists", async
 test("odoo_create_timesheets_bulk reports per-entry failures with indexes and keeps successes", async () => {
   const executeKw = makeExecuteKw({
     "account.analytic.line.create": (args) => {
-      if (args[0].task_id === 99) throw new Error("Access denied");
-      return 1000 + args[0].task_id;
+      const values = record(args[0]);
+      if (values.task_id === 99) throw new Error("Access denied");
+      return 1000 + Number(values.task_id);
     },
   });
   const { handlers } = makeTools(executeKw);

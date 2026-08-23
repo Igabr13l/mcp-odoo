@@ -1,10 +1,24 @@
 import { normalizeLimit, positiveInt } from "../utils/args.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { htmlToText, redactSecrets } from "../utils/format.js";
 import {
+  type AttachmentRecord,
   getAttachmentRows,
   getMessageRows,
   normalizeAttachmentMetadata,
 } from "./ticket-content.js";
+import type {
+  ExecuteKwImplementation,
+  GetAvailableFields,
+  GetNameMap,
+  OdooRecord,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  errorMessage,
+  executeKw as execute,
+  referenceId,
+} from "../contracts.js";
 
 const TASK_FIELDS = [
   "id",
@@ -43,17 +57,22 @@ const TIMESHEET_FIELDS = [
   "task_id",
 ];
 
-function reference(value) {
+interface Reference {
+  id: unknown;
+  name: unknown;
+}
+
+function reference(value: unknown): Reference | null {
   return Array.isArray(value)
     ? { id: value[0], name: value[1] }
     : null;
 }
 
-function safeText(value) {
+function safeText(value: unknown): string {
   return redactSecrets(htmlToText(value));
 }
 
-function normalizeMessage(message) {
+function normalizeMessage(message: OdooRecord) {
   return {
     id: message.id,
     date: message.date || null,
@@ -69,7 +88,7 @@ function normalizeMessage(message) {
   };
 }
 
-function normalizeBranch(branch) {
+function normalizeBranch(branch: OdooRecord) {
   return {
     id: branch.id,
     project: reference(branch.gitlab_origin_project_id),
@@ -82,7 +101,7 @@ function normalizeBranch(branch) {
   };
 }
 
-function normalizeTimesheet(line) {
+function normalizeTimesheet(line: OdooRecord) {
   return {
     id: line.id,
     date: line.date || null,
@@ -95,8 +114,12 @@ function normalizeTimesheet(line) {
   };
 }
 
-export async function getProjectStages(executeKw, projectId) {
-  const rows = await executeKw(
+export async function getProjectStages(
+  executeKw: ExecuteKwImplementation,
+  projectId: number,
+) {
+  const rows = await execute<OdooRecord[]>(
+    executeKw,
     "project.task.type",
     "search_read",
     [
@@ -119,46 +142,55 @@ export async function getProjectStages(executeKw, projectId) {
     fold: Boolean(stage.fold),
     project_ids: stage.project_ids || [],
     applicability:
-      stage.project_ids?.length > 0 ? "project-specific" : "global",
+      (stage.project_ids?.length ?? 0) > 0 ? "project-specific" : "global",
   }));
 }
 
 async function readTask(
-  executeKw,
-  getAvailableFields,
-  taskId,
-  requestedFields = TASK_FIELDS,
-) {
+  executeKw: ExecuteKwImplementation,
+  getAvailableFields: GetAvailableFields | undefined,
+  taskId: number,
+  requestedFields: string[] = TASK_FIELDS,
+): Promise<OdooRecord | null> {
   const fields = getAvailableFields
     ? await getAvailableFields("project.task", requestedFields)
     : requestedFields;
-  const rows = await executeKw("project.task", "read", [[taskId], fields]);
+  const rows = await execute<OdooRecord[]>(executeKw, "project.task", "read", [
+    [taskId],
+    fields,
+  ]);
   return rows?.[0] || null;
 }
 
-async function readBranches(executeKw, ids) {
+async function readBranches(
+  executeKw: ExecuteKwImplementation,
+  ids: number[] | undefined,
+) {
   if (!ids?.length) return [];
-  const rows = await executeKw("gitlab.task.branch", "read", [
+  const rows = await execute<OdooRecord[]>(executeKw, "gitlab.task.branch", "read", [
     ids,
     BRANCH_FIELDS,
   ]);
   return (rows || []).map(normalizeBranch);
 }
 
-async function readTimesheets(executeKw, taskId) {
+async function readTimesheets(executeKw: ExecuteKwImplementation, taskId: number) {
   const domain = [["task_id", "=", taskId]];
-  const lineCount = await executeKw(
+  const lineCount = await execute<number>(
+    executeKw,
     "account.analytic.line",
     "search_count",
     [domain],
   );
-  const aggregateRows = await executeKw(
+  const aggregateRows = await execute<OdooRecord[]>(
+    executeKw,
     "account.analytic.line",
     "read_group",
     [domain, ["unit_amount:sum"], []],
     { lazy: false },
   );
-  const rows = await executeKw(
+  const rows = await execute<OdooRecord[]>(
+    executeKw,
     "account.analytic.line",
     "search_read",
     [domain],
@@ -175,13 +207,17 @@ async function readTimesheets(executeKw, taskId) {
   };
 }
 
-async function readNames(getNameMap, model, ids) {
+async function readNames(
+  getNameMap: GetNameMap | undefined,
+  model: string,
+  ids: number[] | undefined,
+) {
   if (!getNameMap || !ids?.length) return [];
   const names = await getNameMap(model, ids);
   return ids.map((id) => ({ id, name: names.get(Number(id)) || `#${id}` }));
 }
 
-function definitions() {
+function definitions(): Tool[] {
   return [
     {
       name: "odoo_get_project_stages",
@@ -240,8 +276,12 @@ export function createTicketContextTools({
   executeKw,
   getAvailableFields,
   getNameMap,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getAvailableFields?: GetAvailableFields;
+  getNameMap?: GetNameMap;
 }) {
-  return {
+  return defineToolGroup({
     definitions: definitions(),
     handlers: {
       async odoo_get_project_stages(args) {
@@ -286,20 +326,24 @@ export function createTicketContextTools({
           };
         }
 
-        const messageId = await executeKw("project.task", "message_post", [
-          [taskId],
-        ], {
-          body: redactedBody,
-          subtype_xmlid: "mail.mt_note",
-          message_type: "comment",
-        });
+        const messageId = await execute<unknown>(
+          executeKw,
+          "project.task",
+          "message_post",
+          [[taskId]],
+          {
+            body: redactedBody,
+            subtype_xmlid: "mail.mt_note",
+            message_type: "comment",
+          },
+        );
         if (!messageId) throw new Error("Odoo did not post the internal note");
 
         let verifiedMessage = null;
         let verificationError = null;
         if (Number.isInteger(Number(messageId)) && Number(messageId) > 0) {
           try {
-            const rows = await executeKw("mail.message", "read", [
+            const rows = await execute<OdooRecord[]>(executeKw, "mail.message", "read", [
               [Number(messageId)],
               [
                 "id",
@@ -315,7 +359,7 @@ export function createTicketContextTools({
             ]);
             if (rows?.[0]) verifiedMessage = normalizeMessage(rows[0]);
           } catch (error) {
-            verificationError = error?.message || String(error);
+            verificationError = errorMessage(error);
           }
         }
 
@@ -359,7 +403,7 @@ export function createTicketContextTools({
               structuredContent: { task_id: taskId, found: false },
             };
           }
-          const scopedProjectId = scopedTask.project_id?.[0] || null;
+          const scopedProjectId = referenceId(scopedTask.project_id) || null;
           if (scopedProjectId !== expectedProjectId) {
             throw new Error(
               `Task ${taskId} belongs to project ${scopedProjectId || "none"}, expected project ${expectedProjectId}`,
@@ -376,7 +420,7 @@ export function createTicketContextTools({
           };
         }
 
-        const projectId = task.project_id?.[0] || null;
+        const projectId = referenceId(task.project_id) || null;
         const messages = await getMessageRows(executeKw, taskId, {
           includeSystem: args.include_system === true,
           limit: normalizeLimit(args.message_limit, 50, 200),
@@ -437,5 +481,5 @@ export function createTicketContextTools({
         };
       },
     },
-  };
+  });
 }

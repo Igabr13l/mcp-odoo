@@ -1,10 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type {
+  ExecuteKwImplementation,
+  OdooArguments,
+  OdooKeywordArguments,
+} from "../src/contracts.js";
 import { createGitLabTools } from "../src/tools/gitlab.js";
+import type {
+  BranchInspection,
+  GitLabBranchRow,
+} from "../src/tools/gitlab-status.js";
+import { record, required, structuredContent } from "./helpers.js";
 
-function makeFakeOdoo(stubs = {}) {
-  const calls = [];
-  const executeKw = async (model, method, args = [], kwargs = {}) => {
+interface OdooCall {
+  model: string;
+  method: string;
+  args: OdooArguments;
+  kwargs: OdooKeywordArguments;
+}
+
+interface StubContext {
+  args: OdooArguments;
+  kwargs: OdooKeywordArguments;
+}
+
+type OdooStub = (context: StubContext) => unknown | Promise<unknown>;
+type OdooStubs = Record<string, OdooStub>;
+
+function makeFakeOdoo(stubs: OdooStubs = {}) {
+  const calls: OdooCall[] = [];
+  const executeKw: ExecuteKwImplementation = async (
+    model,
+    method,
+    args = [],
+    kwargs = {},
+  ) => {
     calls.push({ model, method, args, kwargs });
     const stub = stubs[`${model}.${method}`];
     if (!stub) throw new Error(`No stub for ${model}.${method}`);
@@ -13,7 +43,12 @@ function makeFakeOdoo(stubs = {}) {
   return { executeKw, calls, stubs };
 }
 
-function taskBranchStubs(taskId, taskName, branchIds, branchRows) {
+function taskBranchStubs(
+  taskId: number,
+  taskName: string,
+  branchIds: number[],
+  branchRows: GitLabBranchRow[],
+): OdooStubs {
   const branchById = new Map(branchRows.map((branch) => [branch.id, branch]));
   return {
     "project.task.read": () => [
@@ -26,7 +61,10 @@ function taskBranchStubs(taskId, taskName, branchIds, branchRows) {
   };
 }
 
-function makeBranchRow(id, overrides = {}) {
+function makeBranchRow(
+  id: number,
+  overrides: Partial<GitLabBranchRow> = {},
+): GitLabBranchRow {
   return {
     id,
     gitlab_origin_project_id: [3, "hubeet/backend"],
@@ -59,7 +97,7 @@ test("definitions expose all GitLab tools with preserved schemas", async (t) => 
   const addBranch = definitions.find(
     (definition) => definition.name === "odoo_gitlab_add_task_branch",
   );
-  assert.deepEqual(addBranch.inputSchema.required, [
+  assert.deepEqual(required(addBranch).inputSchema.required, [
     "task_id",
     "gitlab_project_id",
     "confirm",
@@ -67,7 +105,7 @@ test("definitions expose all GitLab tools with preserved schemas", async (t) => 
   const createBranch = definitions.find(
     (definition) => definition.name === "odoo_gitlab_create_branch",
   );
-  assert.deepEqual(createBranch.inputSchema.required, [
+  assert.deepEqual(required(createBranch).inputSchema.required, [
     "gitlab_task_branch_id",
     "confirm",
   ]);
@@ -87,7 +125,7 @@ test("odoo_get_task_gitlab_branches formats linked branches with a single read",
     getUid: () => 16,
   });
   const result = await handlers.odoo_get_task_gitlab_branches({ task_id: 123 });
-  assert.equal(result.isError, undefined);
+  assert.equal("isError" in result ? result.isError : undefined, undefined);
   assert.match(result.content[0].text, /\[11\] hubeet\/backend/);
   assert.match(result.content[0].text, /branch: odoo\/123-feature/);
   assert.match(result.content[0].text, /author: Gabriel/);
@@ -184,7 +222,10 @@ test("odoo_gitlab_add_task_branch requires confirm, defaults reviewer and branch
   });
   assert.match(preview.content[0].text, /Preview only; no row created/);
   assert.match(preview.content[0].text, /branch: odoo\/123-feature-x/);
-  assert.equal(preview.structuredContent.result, "preview");
+  assert.equal(
+    structuredContent<Record<string, unknown>>(preview).result,
+    "preview",
+  );
   assert.equal(fake.calls.some((call) => call.method === "create"), false);
 
   const created = await handlers.odoo_gitlab_add_task_branch({
@@ -194,12 +235,16 @@ test("odoo_gitlab_add_task_branch requires confirm, defaults reviewer and branch
   });
   assert.match(created.content[0].text, /GitLab task branch row created: 41/);
   assert.match(created.content[0].text, /reviewer: Gabriel/);
-  assert.equal(created.structuredContent.branch_id, 41);
+  assert.equal(
+    structuredContent<Record<string, unknown>>(created).branch_id,
+    41,
+  );
 
   const createCall = fake.calls.find((call) => call.method === "create");
-  assert.equal(createCall.args[0].task_id, 123);
-  assert.equal(createCall.args[0].gitlab_origin_project_id, 3);
-  assert.equal(createCall.args[0].gitlab_user_id, 16);
+  const createValues = record(required(createCall).args[0]);
+  assert.equal(createValues.task_id, 123);
+  assert.equal(createValues.gitlab_origin_project_id, 3);
+  assert.equal(createValues.gitlab_user_id, 16);
 });
 
 test("odoo_gitlab_add_task_branch is idempotent for an existing matching row", async (t) => {
@@ -222,7 +267,10 @@ test("odoo_gitlab_add_task_branch is idempotent for an existing matching row", a
   assert.match(result.content[0].text, /GitLab task branch row already exists: 11/);
   assert.match(result.content[0].text, /https:\/\/gitlab.example\/repo\/-\/tree\/odoo\/123-feature-x/);
   assert.equal(fake.calls.some((call) => call.method === "create"), false);
-  assert.equal(result.structuredContent.result, "already_exists");
+  assert.equal(
+    structuredContent<Record<string, unknown>>(result).result,
+    "already_exists",
+  );
 });
 
 test("odoo_gitlab_create_branch is idempotent and requires confirm", async (t) => {
@@ -272,7 +320,7 @@ test("odoo_gitlab_create_branch preserves the row and proposes a separately conf
   const fake = makeFakeOdoo({
     "gitlab.task.branch.read": () => [row],
     "gitlab.task.branch.write": ({ args }) => {
-      Object.assign(row, args[1]);
+      Object.assign(row, record(args[1]));
       return true;
     },
     "gitlab.task.branch.create_branch": () => {
@@ -295,7 +343,7 @@ test("odoo_gitlab_create_branch preserves the row and proposes a separately conf
 
   const writes = fake.calls.filter((call) => call.method === "write");
   assert.equal(writes.length, 1);
-  assert.equal(writes[0].args[1].gitlab_branch_name, "odoo/123-feature");
+  assert.equal(record(writes[0].args[1]).gitlab_branch_name, "odoo/123-feature");
   assert.equal(
     fake.calls.filter((call) => call.method === "create_branch").length,
     1,
@@ -345,9 +393,12 @@ test("odoo_gitlab_create_merge_request guards, confirms and reports the result",
   const preview = await handlers.odoo_gitlab_create_merge_request({
     gitlab_task_branch_id: 7,
   });
+  const previewData = structuredContent<{
+    divergence: BranchInspection;
+  } & Record<string, unknown>>(preview);
   assert.match(preview.content[0].text, /Preview only; no merge request created/);
   assert.match(preview.content[0].text, /ahead: 2/);
-  assert.equal(preview.structuredContent.divergence.behind, 1);
+  assert.equal(previewData.divergence.behind, 1);
   assert.equal(
     fake.calls.some((call) => call.method === "create_merge_request"),
     false,
@@ -357,12 +408,15 @@ test("odoo_gitlab_create_merge_request guards, confirms and reports the result",
     gitlab_task_branch_id: 7,
     confirm: true,
   });
+  const createdData = structuredContent<{
+    divergence: BranchInspection;
+  } & Record<string, unknown>>(created);
   assert.match(created.content[0].text, /create_merge_request result: true/);
   assert.match(
     created.content[0].text,
     /merge_request_link: https:\/\/gitlab.example\/repo\/-\/merge_requests\/9/,
   );
-  assert.equal(created.structuredContent.divergence.ahead, 2);
+  assert.equal(createdData.divergence.ahead, 2);
 
   const again = await handlers.odoo_gitlab_create_merge_request({
     gitlab_task_branch_id: 7,

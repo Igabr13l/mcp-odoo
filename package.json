@@ -3,11 +3,27 @@
   "version": "2.1.0",
   "description": "MCP para conectar con Odoo - horas, tickets y proyectos",
   "type": "module",
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
   "scripts": {
-    "start": "node src/index.js",
-    "test": "node --test"
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build:src": "tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "build": "npm run clean && npm run build:src",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "npm run clean && npm run build:src && npm run build:test && node scripts/run-tests.mjs",
+    "prepare": "npm run build",
+    "start": "node dist/src/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
   }
 }

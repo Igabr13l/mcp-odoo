@@ -1,8 +1,56 @@
 import { normalizeLimit, positiveInt } from "../utils/args.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  ExecuteKwImplementation,
+  GetAvailableFields,
+  GetUid,
+  OdooArguments,
+  OdooKeywordArguments,
+  OdooRecord,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  errorMessage,
+  executeKw as execute,
+  isRecord,
+  referenceName,
+} from "../contracts.js";
 
 const MAX_BULK_ENTRIES = 100;
 
-function isValidDate(value) {
+interface TimesheetEntry {
+  task_id: number;
+  project_id: number;
+  date: string;
+  hours: number;
+  description: string;
+}
+
+interface TimesheetValues {
+  date?: string;
+  unit_amount?: number;
+  name?: string;
+  task_id?: number;
+  project_id?: number;
+}
+
+interface BulkFailure {
+  index: number;
+  message: string;
+  code?: unknown;
+  outcome?: unknown;
+  retryable?: unknown;
+  verification_required?: unknown;
+}
+
+type GenericExecuteKw = <T = OdooRecord[]>(
+  model: string,
+  method: string,
+  args?: OdooArguments,
+  kwargs?: OdooKeywordArguments,
+) => Promise<T>;
+
+function isValidDate(value: unknown): value is string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return false;
   }
@@ -13,14 +61,14 @@ function isValidDate(value) {
   );
 }
 
-function validateDate(value, label = "date") {
+function validateDate(value: unknown, label = "date"): string {
   if (!isValidDate(value)) {
     throw new Error(`${label} must be a valid YYYY-MM-DD date`);
   }
   return value;
 }
 
-function validateHours(value, label = "hours") {
+function validateHours(value: unknown, label = "hours"): number {
   const hours = Number(value);
   if (!Number.isFinite(hours) || hours <= 0 || hours > 24) {
     throw new Error(`${label} must be a finite positive number no greater than 24`);
@@ -28,22 +76,22 @@ function validateHours(value, label = "hours") {
   return hours;
 }
 
-function validateDescription(value, label = "description") {
+function validateDescription(value: unknown, label = "description"): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(`${label} must be a nonblank string`);
   }
   return value.trim();
 }
 
-function normalizeDescription(value) {
+function normalizeDescription(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function relationId(value) {
+function relationId(value: unknown): unknown {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function nonnegativeInt(value, label) {
+function nonnegativeInt(value: unknown, label: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`${label} must be a nonnegative integer`);
@@ -51,17 +99,26 @@ function nonnegativeInt(value, label) {
   return parsed;
 }
 
-function parseCreateEntry(entry, prefix = "") {
+function parseCreateEntry(entry: unknown, prefix = ""): TimesheetEntry {
+  const value = isRecord(entry) ? entry : {};
   return {
-    task_id: positiveInt(entry.task_id, `${prefix}task_id`),
-    project_id: positiveInt(entry.project_id, `${prefix}project_id`),
-    date: validateDate(entry.date, `${prefix}date`),
-    hours: validateHours(entry.hours, `${prefix}hours`),
-    description: validateDescription(entry.description, `${prefix}description`),
+    task_id: positiveInt(value.task_id, `${prefix}task_id`),
+    project_id: positiveInt(value.project_id, `${prefix}project_id`),
+    date: validateDate(value.date, `${prefix}date`),
+    hours: validateHours(value.hours, `${prefix}hours`),
+    description: validateDescription(value.description, `${prefix}description`),
   };
 }
 
-function buildTimesheetValues({ uid, employeeId, entry }) {
+function buildTimesheetValues({
+  uid,
+  employeeId,
+  entry,
+}: {
+  uid: number | null;
+  employeeId: number;
+  entry: TimesheetEntry;
+}) {
   return {
     date: entry.date,
     employee_id: employeeId,
@@ -73,7 +130,10 @@ function buildTimesheetValues({ uid, employeeId, entry }) {
   };
 }
 
-async function findEmployeeId(executeKw, uid) {
+async function findEmployeeId(
+  executeKw: GenericExecuteKw,
+  uid: number | null,
+): Promise<number> {
   const employees = await executeKw(
     "hr.employee",
     "search_read",
@@ -86,10 +146,14 @@ async function findEmployeeId(executeKw, uid) {
   if (!employees?.length) {
     throw new Error("No employee found for current user");
   }
-  return employees[0].id;
+  return employees[0].id!;
 }
 
-async function readOwnedTimesheet(executeKw, uid, timesheetId) {
+async function readOwnedTimesheet(
+  executeKw: GenericExecuteKw,
+  uid: number | null,
+  timesheetId: number,
+): Promise<OdooRecord> {
   const rows = await executeKw("account.analytic.line", "read", [
     [timesheetId],
     ["id", "user_id", "name", "date", "unit_amount", "project_id", "task_id"],
@@ -102,8 +166,13 @@ async function readOwnedTimesheet(executeKw, uid, timesheetId) {
   return row;
 }
 
-async function findDuplicate(executeKw, uid, entry, excludeId) {
-  const domain = [
+async function findDuplicate(
+  executeKw: GenericExecuteKw,
+  uid: number | null,
+  entry: TimesheetEntry,
+  excludeId?: number,
+): Promise<OdooRecord | undefined> {
+  const domain: unknown[][] = [
     ["user_id", "=", uid],
     ["date", "=", entry.date],
     ["project_id", "=", entry.project_id],
@@ -126,7 +195,7 @@ async function findDuplicate(executeKw, uid, entry, excludeId) {
   );
 }
 
-const definitions = [
+const definitions: Tool[] = [
   {
     name: "odoo_create_timesheet",
     description: "Create a timesheet line for a task",
@@ -223,18 +292,36 @@ const definitions = [
   },
 ];
 
-export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) {
-  let mutationQueue = Promise.resolve();
+export function createTimesheetTools({
+  executeKw: executeKwImplementation,
+  getUid,
+  getAvailableFields,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getUid: GetUid;
+  getAvailableFields?: GetAvailableFields;
+}) {
+  const executeKw: GenericExecuteKw = <T = OdooRecord[]>(
+    model: string,
+    method: string,
+    args: OdooArguments = [],
+    kwargs: OdooKeywordArguments = {},
+  ) => execute<T>(executeKwImplementation, model, method, args, kwargs);
+  let mutationQueue: Promise<unknown> = Promise.resolve();
 
-  function serializeTimesheetMutation(operation) {
+  function serializeTimesheetMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = mutationQueue.then(operation);
     mutationQueue = result.catch(() => undefined);
     return result;
   }
 
-  async function validateTaskProject(taskId, projectId, cache) {
+  async function validateTaskProject(
+    taskId: number,
+    projectId: number,
+    cache?: Map<string, Promise<void>>,
+  ): Promise<void> {
     const cacheKey = `${taskId}:${projectId}`;
-    if (cache?.has(cacheKey)) return cache.get(cacheKey);
+    if (cache?.has(cacheKey)) return cache.get(cacheKey)!;
 
     const validation = (async () => {
       const taskOptionalFields = getAvailableFields
@@ -275,7 +362,10 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
     return validation;
   }
 
-  async function validateCreateEntry(entry, cache) {
+  async function validateCreateEntry(
+    entry: TimesheetEntry,
+    cache?: Map<string, Promise<void>>,
+  ): Promise<void> {
     await validateTaskProject(entry.task_id, entry.project_id, cache);
     const duplicate = await findDuplicate(executeKw, getUid(), entry);
     if (duplicate) {
@@ -283,7 +373,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
     }
   }
 
-  return {
+  return defineToolGroup({
     definitions,
     handlers: {
       async odoo_create_timesheet(args) {
@@ -292,9 +382,11 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         return serializeTimesheetMutation(async () => {
           await validateCreateEntry(entry);
           const employeeId = await findEmployeeId(executeKw, uid);
-          const timesheetId = await executeKw("account.analytic.line", "create", [
-            buildTimesheetValues({ uid, employeeId, entry }),
-          ]);
+          const timesheetId = await executeKw<number>(
+            "account.analytic.line",
+            "create",
+            [buildTimesheetValues({ uid, employeeId, entry })],
+          );
           if (!timesheetId) {
             throw new Error("Odoo did not create the timesheet");
           }
@@ -310,7 +402,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         const offset = args.offset === undefined
           ? 0
           : nonnegativeInt(args.offset, "offset");
-        const domain = [["user_id", "=", getUid()]];
+        const domain: unknown[][] = [["user_id", "=", getUid()]];
         const date = args.date === undefined ? undefined : validateDate(args.date, "date");
         const dateFrom = args.date_from === undefined
           ? undefined
@@ -332,8 +424,8 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         }
 
         const [totalCount, rows] = await Promise.all([
-          executeKw("account.analytic.line", "search_count", [domain]),
-          executeKw("account.analytic.line", "search_read", [domain], {
+          executeKw<number>("account.analytic.line", "search_count", [domain]),
+          executeKw<OdooRecord[]>("account.analytic.line", "search_read", [domain], {
             fields: [
               "id",
               "date",
@@ -353,8 +445,8 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
           0,
         );
         const lines = (rows || []).map((r) => {
-          const project = r.project_id?.[1] || "N/A";
-          const task = r.task_id?.[1] || "N/A";
+          const project = referenceName(r.project_id) || "N/A";
+          const task = referenceName(r.task_id) || "N/A";
           return `[${r.id}] ${r.date} - ${r.unit_amount || 0}h\n   ${project} / ${task}\n   ${r.name || ""}`;
         });
 
@@ -391,7 +483,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         const timesheetId = positiveInt(args.timesheet_id, "timesheet_id");
         return serializeTimesheetMutation(async () => {
           const current = await readOwnedTimesheet(executeKw, getUid(), timesheetId);
-          const values = {};
+          const values: TimesheetValues = {};
 
           if (args.date !== undefined) values.date = validateDate(args.date, "date");
           if (args.hours !== undefined) {
@@ -411,18 +503,25 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
             throw new Error("Nothing to update");
           }
 
-          const effective = {
-            task_id: values.task_id ?? relationId(current.task_id),
-            project_id: values.project_id ?? relationId(current.project_id),
-            date: values.date ?? current.date,
-            hours: values.unit_amount ?? current.unit_amount,
-            description: values.name ?? current.name,
+          const effective: TimesheetEntry = {
+            task_id: positiveInt(
+              values.task_id ?? relationId(current.task_id),
+              "task_id",
+            ),
+            project_id: positiveInt(
+              values.project_id ?? relationId(current.project_id),
+              "project_id",
+            ),
+            date: validateDate(values.date ?? current.date, "date"),
+            hours: validateHours(
+              values.unit_amount ?? current.unit_amount,
+              "hours",
+            ),
+            description: validateDescription(
+              values.name ?? current.name,
+              "description",
+            ),
           };
-          effective.task_id = positiveInt(effective.task_id, "task_id");
-          effective.project_id = positiveInt(effective.project_id, "project_id");
-          validateDate(effective.date, "date");
-          validateHours(effective.hours, "hours");
-          validateDescription(effective.description, "description");
           await validateTaskProject(effective.task_id, effective.project_id);
           const duplicate = await findDuplicate(
             executeKw,
@@ -436,7 +535,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
             );
           }
 
-          const ok = await executeKw("account.analytic.line", "write", [
+          const ok = await executeKw<boolean>("account.analytic.line", "write", [
             [timesheetId],
             values,
           ]);
@@ -444,8 +543,8 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
             throw new Error("Update failed");
           }
 
-          let row = null;
-          let verificationError = null;
+          let row: OdooRecord | null = null;
+          let verificationError: string | null = null;
           try {
             const updated = await executeKw("account.analytic.line", "read", [
               [timesheetId],
@@ -453,7 +552,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
             ]);
             row = updated?.[0] || null;
           } catch (error) {
-            verificationError = error?.message || String(error);
+            verificationError = errorMessage(error);
           }
           return {
             content: [
@@ -479,7 +578,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         const timesheetId = positiveInt(args.timesheet_id, "timesheet_id");
         return serializeTimesheetMutation(async () => {
           await readOwnedTimesheet(executeKw, getUid(), timesheetId);
-          const ok = await executeKw("account.analytic.line", "unlink", [
+          const ok = await executeKw<boolean>("account.analytic.line", "unlink", [
             [timesheetId],
           ]);
           if (!ok) {
@@ -506,30 +605,37 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         return serializeTimesheetMutation(async () => {
           const uid = getUid();
           const employeeId = await findEmployeeId(executeKw, uid);
-          const createdIds = [];
-          const failed = [];
-          const taskValidationCache = new Map();
+          const createdIds: number[] = [];
+          const failed: BulkFailure[] = [];
+          const taskValidationCache = new Map<string, Promise<void>>();
 
           for (let i = 0; i < entries.length; i += 1) {
             const e = entries[i];
             try {
               const entry = parseCreateEntry(e, `entries[${i}].`);
               await validateCreateEntry(entry, taskValidationCache);
-              const id = await executeKw("account.analytic.line", "create", [
+              const id = await executeKw<number>("account.analytic.line", "create", [
                 buildTimesheetValues({ uid, employeeId, entry }),
               ]);
               if (!id) throw new Error("Odoo did not create the timesheet");
               createdIds.push(id);
             } catch (err) {
-              const failure = { index: i, message: err.message };
-              if (err.code !== undefined) failure.code = err.code;
-              if (err.outcome !== undefined) failure.outcome = err.outcome;
-              if (err.retryable !== undefined) failure.retryable = err.retryable;
-              if (err.verificationRequired !== undefined) {
-                failure.verification_required = err.verificationRequired;
+              const details = isRecord(err) ? err : {};
+              const failure: BulkFailure = {
+                index: i,
+                message: errorMessage(err),
+              };
+              if (details.code !== undefined) failure.code = details.code;
+              if (details.outcome !== undefined) failure.outcome = details.outcome;
+              if (details.retryable !== undefined) failure.retryable = details.retryable;
+              if (details.verificationRequired !== undefined) {
+                failure.verification_required = details.verificationRequired;
               }
               failed.push(failure);
-              if (err.outcome === "uncertain" || err.verificationRequired === true) {
+              if (
+                details.outcome === "uncertain" ||
+                details.verificationRequired === true
+              ) {
                 for (let skippedIndex = i + 1; skippedIndex < entries.length; skippedIndex += 1) {
                   failed.push({
                     index: skippedIndex,
@@ -548,7 +654,7 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
                         "Bulk create stopped: an entry has an uncertain outcome",
                         `Created: ${createdIds.length}`,
                         `IDs: ${createdIds.join(", ") || "none"}`,
-                        `Uncertain entry: ${i} - ${err.message}`,
+                        `Uncertain entry: ${i} - ${errorMessage(err)}`,
                         `Skipped: ${entries.length - i - 1}`,
                       ].join("\n"),
                     },
@@ -581,5 +687,5 @@ export function createTimesheetTools({ executeKw, getUid, getAvailableFields }) 
         });
       },
     },
-  };
+  });
 }

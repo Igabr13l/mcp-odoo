@@ -1,8 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type {
+  ExecuteKwImplementation,
+  GetUid,
+  OdooArguments,
+  OdooKeywordArguments,
+} from "../src/contracts.js";
 import { createProjectTools } from "../src/tools/projects.js";
 
-function buildTools({ executeKw, getUid }) {
+interface ProjectCall {
+  model: string;
+  method: string;
+  args?: OdooArguments;
+  kwargs?: OdooKeywordArguments;
+}
+
+function buildTools({
+  executeKw,
+  getUid,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getUid: GetUid;
+}) {
   return createProjectTools({ executeKw, getUid });
 }
 
@@ -30,7 +49,7 @@ test("definitions expose the public project schemas", () => {
 });
 
 test("odoo_get_projects lists active projects", async () => {
-  const calls = [];
+  const calls: ProjectCall[] = [];
   const tools = buildTools({
     getUid: () => 16,
     executeKw: async (model, method, args, kwargs) => {
@@ -56,7 +75,7 @@ test("odoo_get_projects lists active projects", async () => {
 });
 
 test("odoo_get_my_projects dedupes, sorts and uses getUid", async () => {
-  const calls = [];
+  const calls: ProjectCall[] = [];
   const tools = buildTools({
     getUid: () => 16,
     executeKw: async (model, method, args, kwargs) => {

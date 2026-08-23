@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExecuteKwImplementation } from "../src/contracts.js";
 import { createBoardTools } from "../src/tools/board.js";
 
 test("board keeps same-name stages separate and preserves Odoo progress percent", async () => {
-  const executeKw = async (model) => {
+  const executeKw: ExecuteKwImplementation = async (model) => {
     if (model === "project.task") {
       return [
         { id: 1, name: "A", stage_id: [10, "Review"], progress: 25 },

@@ -4,6 +4,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { ToolArguments } from "./contracts.js";
+import { errorMessage, isRecord } from "./contracts.js";
 import { createOdooClient } from "./odoo/client.js";
 import { createBoardTools } from "./tools/board.js";
 import { createGitLabTools } from "./tools/gitlab.js";
@@ -35,9 +38,17 @@ const toolGroups = [
   createTimesheetTools(dependencies),
 ];
 
-function createToolRegistry(groups) {
-  const definitions = [];
-  const handlers = new Map();
+interface ToolGroup {
+  definitions: Tool[];
+  handlers: Record<string, (args: ToolArguments) => Promise<CallToolResult>>;
+}
+
+function createToolRegistry(groups: ToolGroup[]) {
+  const definitions: Tool[] = [];
+  const handlers = new Map<
+    string,
+    (args: ToolArguments) => Promise<CallToolResult>
+  >();
   for (const group of groups) {
     for (const definition of group.definitions) {
       if (handlers.has(definition.name)) {
@@ -81,12 +92,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     return await handler(args);
   } catch (error) {
+    const details = isRecord(error) ? error : {};
     const errorDetails = {
-      code: error?.code || "UNEXPECTED_ERROR",
-      message: error?.message || String(error),
-      outcome: error?.outcome || "failed",
-      retryable: error?.retryable === true,
-      verification_required: error?.verificationRequired === true,
+      code: details.code || "UNEXPECTED_ERROR",
+      message: errorMessage(error),
+      outcome: details.outcome || "failed",
+      retryable: details.retryable === true,
+      verification_required: details.verificationRequired === true,
     };
     const verificationHint = errorDetails.verification_required
       ? " Outcome is uncertain; verify the remote state before retrying."

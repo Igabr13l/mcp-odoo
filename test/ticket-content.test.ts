@@ -1,12 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExecuteKwImplementation } from "../src/contracts.js";
 import {
   createTicketContentTools,
   normalizeAttachmentMetadata,
 } from "../src/tools/ticket-content.js";
+import {
+  array,
+  required,
+  structuredContent,
+  textContent,
+} from "./helpers.js";
+
+interface AttachmentMetadata {
+  name: string;
+  description: string;
+  provenance?: {
+    task_direct: boolean;
+    source_messages: { id?: number; date: string | null }[];
+  };
+}
+
+interface AttachmentContent extends Record<string, unknown> {
+  attachments: AttachmentMetadata[];
+}
+
+interface ImageContent extends Record<string, unknown> {
+  images: AttachmentMetadata[];
+}
 
 function makeTools() {
-  const executeKw = async (model, method, args, kwargs) => {
+  const executeKw: ExecuteKwImplementation = async (
+    model,
+    method,
+    args = [],
+    kwargs = {},
+  ) => {
     if (model === "mail.message" && method === "search_read") {
       return [
         {
@@ -33,7 +62,7 @@ function makeTools() {
       ];
     }
     if (model === "ir.attachment" && method === "read") {
-      if (args[1].includes("datas")) {
+      if (array(args[1]).includes("datas")) {
         return [
           {
             id: 50,
@@ -67,10 +96,11 @@ test("ticket attachment output includes task-direct and source-message provenanc
   const result = await makeTools().handlers.odoo_get_ticket_attachments({
     task_id: 7,
   });
+  const data = structuredContent<AttachmentContent>(result);
 
-  assert.match(result.content[0].text, /task-direct/);
-  assert.match(result.content[0].text, /message:30 2026-08-09 09:30:00 Lin/);
-  assert.deepEqual(result.structuredContent.attachments[1].provenance, {
+  assert.match(textContent(result), /task-direct/);
+  assert.match(textContent(result), /message:30 2026-08-09 09:30:00 Lin/);
+  assert.deepEqual(data.attachments[1].provenance, {
     task_direct: false,
     source_messages: [
       {
@@ -81,32 +111,33 @@ test("ticket attachment output includes task-direct and source-message provenanc
     ],
   });
   assert.equal(
-    result.structuredContent.attachments[0].description,
+    data.attachments[0].description,
     "token: [REDACTED]",
   );
   assert.doesNotMatch(
     JSON.stringify(result),
     /direct-secret|image-secret|direct-filename-secret|image-filename-secret/,
   );
-  assert.match(result.content[0].text, /token=\[REDACTED\]/);
-  assert.equal(result.structuredContent.attachments[0].name, "token=[REDACTED]");
+  assert.match(textContent(result), /token=\[REDACTED\]/);
+  assert.equal(data.attachments[0].name, "token=[REDACTED]");
 });
 
 test("ticket image output carries attachment provenance in text and structured content", async () => {
   const result = await makeTools().handlers.odoo_get_ticket_images({ task_id: 7 });
+  const data = structuredContent<ImageContent>(result);
 
-  assert.match(result.content[0].text, /message:30 2026-08-09 09:30:00 Lin/);
+  assert.match(textContent(result), /message:30 2026-08-09 09:30:00 Lin/);
   assert.equal(result.content[1].type, "image");
   assert.equal(
-    result.structuredContent.images[0].provenance.source_messages[0].id,
+    required(data.images[0].provenance).source_messages[0].id,
     30,
   );
   assert.equal(
-    result.structuredContent.images[0].description,
+    data.images[0].description,
     "password: [REDACTED]",
   );
-  assert.equal(result.structuredContent.images[0].name, "secret=[REDACTED]");
-  assert.match(result.content[0].text, /password=\[REDACTED\]/);
+  assert.equal(data.images[0].name, "secret=[REDACTED]");
+  assert.match(textContent(result), /password=\[REDACTED\]/);
   assert.doesNotMatch(
     JSON.stringify(result),
     /image-secret|image-filename-secret|image-read-filename-secret/,

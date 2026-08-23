@@ -1,10 +1,39 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type {
+  OdooArguments,
+  OdooKeywordArguments,
+} from "../src/contracts.js";
+import { required } from "./helpers.js";
 const { createTaskTools } = await import("../src/tools/tasks.js");
 
-function makeTools({ routes = {}, deps = {} } = {}) {
-  const calls = [];
-  const executeKw = async (model, method, args, kwargs) => {
+interface OdooCall {
+  model: string;
+  method: string;
+  args: OdooArguments;
+  kwargs: OdooKeywordArguments;
+}
+
+type Route = (
+  args: OdooArguments,
+  kwargs: OdooKeywordArguments,
+) => unknown | Promise<unknown>;
+type Routes = Record<string, Route>;
+type TaskDependencies = Parameters<typeof createTaskTools>[0];
+
+interface MakeToolsOptions {
+  routes?: Routes;
+  deps?: Partial<Omit<TaskDependencies, "executeKw">>;
+}
+
+function makeTools({ routes = {}, deps = {} }: MakeToolsOptions = {}) {
+  const calls: OdooCall[] = [];
+  const executeKw: TaskDependencies["executeKw"] = async (
+    model,
+    method,
+    args = [],
+    kwargs = {},
+  ) => {
     calls.push({ model, method, args, kwargs });
     const handler = routes[`${model}:${method}`];
     if (handler) return handler(args, kwargs);
@@ -121,7 +150,7 @@ test("odoo_get_my_tasks builds an exact stage-name domain", async () => {
   const taskCall = calls.find(
     (c) => c.model === "project.task" && c.method === "search_read",
   );
-  assert.deepEqual(taskCall.args[0], [
+  assert.deepEqual(required(taskCall).args[0], [
     ["user_ids", "=", 16],
     ["project_id", "=", 7],
     ["stage_id.name", "=ilike", "To Do"],
@@ -142,7 +171,7 @@ test("odoo_get_my_tasks without state does not resolve stages", async () => {
     false,
   );
   assert.deepEqual(
-    calls.find((c) => c.model === "project.task").args[0],
+    required(calls.find((c) => c.model === "project.task")).args[0],
     [["user_ids", "=", 16]],
   );
 });
@@ -234,7 +263,7 @@ test("odoo_get_tickets clamps limit and supports mine=false", async () => {
   const taskCall = calls.find(
     (c) => c.model === "project.task" && c.method === "search_read",
   );
-  assert.deepEqual(taskCall.args[0], []);
+  assert.deepEqual(required(taskCall).args[0], []);
 });
 
 test("odoo_get_tickets applies search filter and state resolution", async () => {
@@ -252,7 +281,7 @@ test("odoo_get_tickets applies search filter and state resolution", async () => 
   const taskCall = calls.find(
     (c) => c.model === "project.task" && c.method === "search_read",
   );
-  assert.deepEqual(taskCall.args[0], [
+  assert.deepEqual(required(taskCall).args[0], [
     ["user_ids", "=", 16],
     ["stage_id.name", "=ilike", "In Progress"],
     ["name", "ilike", "whatsapp"],
@@ -326,7 +355,15 @@ test("odoo_get_task_detail validates task_id", async () => {
   );
 });
 
-function updateTools({ current, updated = current, stages = [] }) {
+function updateTools({
+  current,
+  updated = current,
+  stages = [],
+}: {
+  current: unknown;
+  updated?: unknown;
+  stages?: unknown[];
+}) {
   let readCount = 0;
   return makeTools({
     routes: {
@@ -372,7 +409,7 @@ test("odoo_update_task prefers project-specific stage over global", async () => 
   const writeCall = calls.find(
     (c) => c.model === "project.task" && c.method === "write",
   );
-  assert.deepEqual(writeCall.args[1], { stage_id: 8, description: "new" });
+  assert.deepEqual(required(writeCall).args[1], { stage_id: 8, description: "new" });
   assert.equal(
     result.content[0].text,
     [
@@ -407,7 +444,7 @@ test("odoo_update_task falls back to a single global stage", async () => {
   const writeCall = calls.find(
     (c) => c.model === "project.task" && c.method === "write",
   );
-  assert.deepEqual(writeCall.args[1], { stage_id: 5 });
+  assert.deepEqual(required(writeCall).args[1], { stage_id: 5 });
 });
 
 test("odoo_update_task throws on ambiguous global stages", async () => {
@@ -467,7 +504,7 @@ test("odoo_update_task uses stage_id directly without stage lookup", async () =>
   const writeCall = calls.find(
     (c) => c.model === "project.task" && c.method === "write",
   );
-  assert.deepEqual(writeCall.args[1], { stage_id: 9 });
+  assert.deepEqual(required(writeCall).args[1], { stage_id: 9 });
 });
 
 test("odoo_update_task filters assignees to positive integers", async () => {
@@ -488,7 +525,7 @@ test("odoo_update_task filters assignees to positive integers", async () => {
   const writeCall = calls.find(
     (c) => c.model === "project.task" && c.method === "write",
   );
-  assert.deepEqual(writeCall.args[1], { user_ids: [[6, 0, [16, 17]]] });
+  assert.deepEqual(required(writeCall).args[1], { user_ids: [[6, 0, [16, 17]]] });
 });
 
 test("odoo_update_task returns Task not found", async () => {

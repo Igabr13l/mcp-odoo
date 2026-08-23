@@ -1,5 +1,15 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import type {
+  ExecuteKwImplementation,
+  GetAvailableFields,
+  GetNameMap,
+  GetSelectionLabelMap,
+  OdooArguments,
+  OdooKeywordArguments,
+  OdooRecord,
+} from "../contracts.js";
+import { errorMessage, isRecord } from "../contracts.js";
 import { hasValue } from "../utils/format.js";
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -24,12 +34,25 @@ const READ_ONLY_METHODS = new Set([
 ]);
 
 export class OdooRequestError extends Error {
-  constructor(message, {
-    code,
-    retryable = false,
-    outcome = "failed",
-    verificationRequired = false,
-  }) {
+  readonly code: string;
+  readonly retryable: boolean;
+  outcome: string;
+  verificationRequired: boolean;
+
+  constructor(
+    message: string,
+    {
+      code,
+      retryable = false,
+      outcome = "failed",
+      verificationRequired = false,
+    }: {
+      code: string;
+      retryable?: boolean;
+      outcome?: string;
+      verificationRequired?: boolean;
+    },
+  ) {
     super(message);
     this.name = "OdooRequestError";
     this.code = code;
@@ -39,18 +62,33 @@ export class OdooRequestError extends Error {
   }
 }
 
-function requestTimeout(value) {
+function requestTimeout(value: unknown): number {
   return Math.max(1000, Math.min(120000, Number(value) || DEFAULT_TIMEOUT_MS));
 }
 
-function retryBackoff(value) {
+function retryBackoff(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0
     ? parsed
     : DEFAULT_RETRY_BACKOFF_MS;
 }
 
-function rpcError(data, fallback) {
+interface JsonRpcErrorResponse {
+  error: {
+    message?: string;
+    data?: { message?: string; name?: string; exception_type?: string };
+  };
+  result?: unknown;
+}
+
+interface JsonRpcSuccessResponse {
+  error?: undefined;
+  result?: unknown;
+}
+
+type JsonRpcResponse = JsonRpcErrorResponse | JsonRpcSuccessResponse;
+
+function rpcError(data: JsonRpcErrorResponse, fallback: string): OdooRequestError {
   const message = data.error.data?.message || data.error.message || fallback;
   const type = `${data.error.data?.name || ""} ${data.error.data?.exception_type || ""}`;
   if (/accessdenied|authentication|sessionexpired/i.test(`${type} ${message}`)) {
@@ -62,15 +100,81 @@ function rpcError(data, fallback) {
   return new OdooRequestError(message, { code: "ODOO_SERVER_ERROR" });
 }
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return ms ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
+
+export interface FetchResponse {
+  ok: boolean;
+  status?: number;
+  statusText?: string;
+  type?: string;
+  json?: () => Promise<unknown>;
+}
+
+export type FetchImplementation = (
+  url: string,
+  init: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+    redirect?: RequestRedirect;
+  },
+) => Promise<FetchResponse>;
+
+export interface OdooSession {
+  [key: string]: unknown;
+  active: boolean;
+  stored: boolean;
+  verified: boolean;
+  uid: number | null;
+  login: string | null;
+  name: string | null;
+  db: string | undefined;
+  url: string | undefined;
+}
+
+export interface AuthenticateArguments {
+  url?: string;
+  db?: string;
+  login: string;
+  password: string;
+  remember?: boolean;
+}
+
+export interface OdooClient {
+  authenticate(args: AuthenticateArguments): Promise<{
+    uid: number;
+    name: string;
+    login: string;
+  }>;
+  ensureAuthenticated(): Promise<void>;
+  executeKw: {
+    <T = unknown>(
+      model: string,
+      method: string,
+      args?: OdooArguments,
+      kwargs?: OdooKeywordArguments,
+    ): Promise<T>;
+  };
+  getAvailableFields: GetAvailableFields;
+  getNameMap: GetNameMap;
+  getSelectionLabelMap: GetSelectionLabelMap;
+  getSession(): Promise<OdooSession>;
+  getUid(): number | null;
+  logout(): Promise<void>;
 }
 
 export function createOdooClient({
   env = process.env,
   fetchImpl = fetch,
   retryBackoffMs,
-} = {}) {
+}: {
+  env?: Record<string, string | undefined>;
+  fetchImpl?: FetchImplementation;
+  retryBackoffMs?: number;
+} = {}): OdooClient {
   const sessionFile =
     env.ODOO_SESSION_FILE ||
     `${env.HOME || ""}/.config/mcp-odoo/session.json`;
@@ -78,7 +182,16 @@ export function createOdooClient({
   const executeRetryBackoffMs = retryBackoff(
     retryBackoffMs ?? env.ODOO_RETRY_BACKOFF_MS,
   );
-  const state = {
+  const state: {
+    url: string | undefined;
+    db: string | undefined;
+    uid: number | null;
+    login: string | null;
+    password: string | null;
+    name: string | null;
+    verified: boolean;
+    sessionLoaded: boolean;
+  } = {
     url: env.ODOO_URL,
     db: env.ODOO_DB,
     uid: null,
@@ -88,10 +201,10 @@ export function createOdooClient({
     verified: false,
     sessionLoaded: false,
   };
-  const fieldAvailabilityCache = new Map();
-  const selectionCache = new Map();
-  let authenticationPromise = null;
-  let sessionLoadPromise = null;
+  const fieldAvailabilityCache = new Map<string, boolean>();
+  const selectionCache = new Map<string, Map<unknown, string>>();
+  let authenticationPromise: Promise<void> | null = null;
+  let sessionLoadPromise: Promise<void> | null = null;
   let sessionGeneration = 0;
 
   function clearMetadataCaches() {
@@ -99,7 +212,10 @@ export function createOdooClient({
     selectionCache.clear();
   }
 
-  async function postJsonRpc(url, payload) {
+  async function postJsonRpc(
+    url: string | undefined,
+    payload: Record<string, unknown>,
+  ): Promise<JsonRpcResponse> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -114,28 +230,34 @@ export function createOdooClient({
           `Odoo HTTP ${response.status} ${response.statusText}`,
           {
             code: "HTTP_ERROR",
-            retryable: response.status >= 500 || response.status === 429,
+            retryable:
+              (response.status !== undefined && response.status >= 500) ||
+              response.status === 429,
           },
         );
       }
       try {
-        return await response.json();
+        if (!response.json) throw new SyntaxError("Missing JSON reader");
+        return (await response.json()) as JsonRpcResponse;
       } catch {
         throw new OdooRequestError("Odoo returned an invalid JSON response", {
           code: "INVALID_JSON",
         });
       }
     } catch (error) {
-      if (error?.name === "AbortError") {
+      if (isRecord(error) && error.name === "AbortError") {
         throw new OdooRequestError(
           `Odoo request timed out after ${timeoutMs}ms`,
           { code: "TIMEOUT", retryable: true },
         );
       }
       if (error instanceof OdooRequestError) throw error;
-      const cause = error?.cause?.code || error?.cause?.message;
+      const causeObject = isRecord(error) && isRecord(error.cause)
+        ? error.cause
+        : null;
+      const cause = causeObject?.code || causeObject?.message;
       throw new OdooRequestError(
-        `Odoo network error: ${error?.message || String(error)}${cause ? ` (${cause})` : ""}`,
+        `Odoo network error: ${errorMessage(error)}${cause ? ` (${String(cause)})` : ""}`,
         { code: "NETWORK_ERROR", retryable: true },
       );
     } finally {
@@ -143,15 +265,15 @@ export function createOdooClient({
     }
   }
 
-  async function callJsonRpc(payload) {
+  async function callJsonRpc<T>(payload: Record<string, unknown>): Promise<T> {
     const data = await postJsonRpc(state.url, payload);
     if (data.error) {
       throw rpcError(data, "Odoo Server Error");
     }
-    return data.result;
+    return data.result as T;
   }
 
-  async function savePersistedSession(generation) {
+  async function savePersistedSession(generation: number): Promise<void> {
     await mkdir(dirname(sessionFile), { recursive: true, mode: 0o700 });
     const payload = {
       url: state.url,
@@ -177,7 +299,9 @@ export function createOdooClient({
     if (!sessionLoadPromise) {
       sessionLoadPromise = (async () => {
         try {
-          const parsed = JSON.parse(await readFile(sessionFile, "utf8"));
+          const parsed = JSON.parse(
+            await readFile(sessionFile, "utf8"),
+          ) as Partial<typeof state>;
           if (!parsed?.login || !parsed?.password) return;
           state.url = parsed.url || state.url;
           state.db = parsed.db || state.db;
@@ -213,7 +337,12 @@ export function createOdooClient({
     await rm(sessionFile, { force: true });
   }
 
-  async function commonAuthenticate(url, db, login, password) {
+  async function commonAuthenticate(
+    url: string,
+    db: string,
+    login: string,
+    password: string,
+  ): Promise<number | null> {
     const data = await postJsonRpc(url, {
       jsonrpc: "2.0",
       method: "call",
@@ -227,7 +356,7 @@ export function createOdooClient({
     if (data.error) {
       throw rpcError(data, "Odoo auth error");
     }
-    return data.result || null;
+    return (data.result as number | null) || null;
   }
 
   async function ensureAuthenticated() {
@@ -240,12 +369,13 @@ export function createOdooClient({
     }
     if (!authenticationPromise) {
       const generation = sessionGeneration;
+      const { url, db, login, password } = state;
       authenticationPromise = (async () => {
         const uid = await commonAuthenticate(
-          state.url,
-          state.db,
-          state.login,
-          state.password,
+          url!,
+          db!,
+          login,
+          password,
         );
         if (generation !== sessionGeneration) {
           throw new Error("Authentication was cancelled by logout");
@@ -266,7 +396,12 @@ export function createOdooClient({
     await authenticationPromise;
   }
 
-  async function executeKw(model, method, args = [], kwargs = {}) {
+  async function executeKw<T = unknown>(
+    model: string,
+    method: string,
+    args: OdooArguments = [],
+    kwargs: OdooKeywordArguments = {},
+  ): Promise<T> {
     try {
       await ensureAuthenticated();
       const generation = sessionGeneration;
@@ -282,26 +417,27 @@ export function createOdooClient({
         id: Date.now(),
       };
       try {
-        const result = await callJsonRpc(payload);
+        const result = await callJsonRpc<T>(payload);
         if (generation === sessionGeneration) state.verified = true;
         return result;
       } catch (error) {
+        if (!(error instanceof OdooRequestError)) throw error;
         const transportFailure =
-          error?.code === "NETWORK_ERROR" || error?.code === "TIMEOUT";
+          error.code === "NETWORK_ERROR" || error.code === "TIMEOUT";
         if (readOnly && transportFailure && error.retryable) {
           await sleep(executeRetryBackoffMs);
-          const result = await callJsonRpc(payload);
+          const result = await callJsonRpc<T>(payload);
           if (generation === sessionGeneration) state.verified = true;
           return result;
         }
         const uncertainTransportFailure =
           transportFailure ||
-          error?.code === "HTTP_ERROR" ||
-          error?.code === "INVALID_JSON";
+          error.code === "HTTP_ERROR" ||
+          error.code === "INVALID_JSON";
         if (
           !readOnly &&
           uncertainTransportFailure &&
-          (error.retryable || error?.code === "INVALID_JSON")
+          (error.retryable || error.code === "INVALID_JSON")
         ) {
           error.outcome = "uncertain";
           error.verificationRequired = true;
@@ -309,12 +445,20 @@ export function createOdooClient({
         throw error;
       }
     } catch (error) {
-      if (error?.code === "AUTHENTICATION_ERROR") state.verified = false;
+      if (error instanceof OdooRequestError && error.code === "AUTHENTICATION_ERROR") {
+        state.verified = false;
+      }
       throw error;
     }
   }
 
-  async function authenticate({ url, db, login, password, remember = true }) {
+  async function authenticate({
+    url,
+    db,
+    login,
+    password,
+    remember = true,
+  }: AuthenticateArguments) {
     await loadPersistedSession();
     const generation = sessionGeneration;
     const nextUrl = url ? url.replace(/\/$/, "") : state.url;
@@ -339,13 +483,20 @@ export function createOdooClient({
       uid,
       verified: true,
     });
-    const users = await executeKw("res.users", "read", [[uid], ["name", "login"]]);
+    const users = await executeKw<OdooRecord[]>("res.users", "read", [
+      [uid],
+      ["name", "login"],
+    ]);
     state.name = users?.[0]?.name || login;
     if (generation !== sessionGeneration) {
       throw new Error("Authentication was cancelled by logout");
     }
     if (remember !== false) await savePersistedSession(generation);
-    return { uid, name: state.name, login: users?.[0]?.login || login };
+    return {
+      uid,
+      name: state.name,
+      login: users?.[0]?.login || login,
+    } as { uid: number; name: string; login: string };
   }
 
   async function getSession() {
@@ -362,15 +513,21 @@ export function createOdooClient({
     };
   }
 
-  async function getAvailableFields(model, fieldNames) {
+  async function getAvailableFields(
+    model: string,
+    fieldNames: string[],
+  ): Promise<string[]> {
     const names = fieldNames.filter(Boolean);
     const missing = names.filter(
       (fieldName) => !fieldAvailabilityCache.has(`${model}:${fieldName}`),
     );
     if (missing.length) {
-      const metadata = await executeKw(model, "fields_get", [missing], {
-        attributes: ["type"],
-      });
+      const metadata = await executeKw<Record<string, unknown>>(
+        model,
+        "fields_get",
+        [missing],
+        { attributes: ["type"] },
+      );
       for (const fieldName of missing) {
         fieldAvailabilityCache.set(
           `${model}:${fieldName}`,
@@ -381,28 +538,44 @@ export function createOdooClient({
     return names.filter((name) => fieldAvailabilityCache.get(`${model}:${name}`));
   }
 
-  async function getSelectionLabelMap(model, fieldName) {
+  async function getSelectionLabelMap(
+    model: string,
+    fieldName: string,
+  ): Promise<Map<unknown, string>> {
     const key = `${model}:${fieldName}:selection`;
-    if (selectionCache.has(key)) return selectionCache.get(key);
-    const metadata = await executeKw(model, "fields_get", [[fieldName]], {
+    if (selectionCache.has(key)) return selectionCache.get(key)!;
+    const metadata = await executeKw<
+      Record<string, { selection?: [unknown, string][] }>
+    >(model, "fields_get", [[fieldName]], {
       attributes: ["selection"],
     });
-    const map = new Map(metadata?.[fieldName]?.selection || []);
+    const map = new Map<unknown, string>(
+      metadata?.[fieldName]?.selection || [],
+    );
     selectionCache.set(key, map);
     return map;
   }
 
-  async function getNameMap(model, ids) {
+  async function getNameMap(
+    model: string,
+    ids: number[],
+  ): Promise<Map<number, string>> {
     const cleanIds = [
       ...new Set(
         (ids || []).map(Number).filter((id) => Number.isInteger(id) && id > 0),
       ),
     ];
     if (!cleanIds.length) return new Map();
-    const rows = await executeKw(model, "read", [cleanIds, ["name"]]);
+    const rows = await executeKw<OdooRecord[]>(model, "read", [
+      cleanIds,
+      ["name"],
+    ]);
     return new Map(
       (rows || [])
-        .filter((row) => row?.id && hasValue(row?.name))
+        .filter(
+          (row): row is OdooRecord & { id: number; name: string } =>
+            Boolean(row?.id) && typeof row?.name === "string" && hasValue(row.name),
+        )
         .map((row) => [row.id, row.name]),
     );
   }

@@ -5,6 +5,18 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  ExecuteKwImplementation,
+  OdooRecord,
+  ToolArguments,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  executeKw as execute,
+  referenceId,
+  referenceName,
+} from "../contracts.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,12 +43,25 @@ const SUPPORTED_VIDEO_TYPES = new Set([
   "video/webm",
 ]);
 
-function taskIdFrom(args) {
+interface SourceMessage {
+  id: number | undefined;
+  date: string | null;
+  author: { id: number | null; name: string };
+}
+
+export interface AttachmentRecord extends OdooRecord {
+  provenance?: {
+    task_direct: boolean;
+    source_messages: SourceMessage[];
+  };
+}
+
+function taskIdFrom(args: ToolArguments): number {
   return positiveInt(args.task_id, "task_id");
 }
 
-function messageLabel(message) {
-  const subtype = message.subtype_id?.[1] || "No subtype";
+function messageLabel(message: OdooRecord): string {
+  const subtype = referenceName(message.subtype_id) || "No subtype";
   const normalizedSubtype = subtype.toLowerCase();
   if (normalizedSubtype.includes("note") || normalizedSubtype.includes("nota")) {
     return "Internal note";
@@ -45,8 +70,8 @@ function messageLabel(message) {
   return "Message";
 }
 
-function formatMessage(message, redact) {
-  const author = message.author_id?.[1] || message.email_from || "System";
+function formatMessage(message: OdooRecord, redact: boolean): string {
+  const author = referenceName(message.author_id) || message.email_from || "System";
   const body = htmlToText(message.body);
   const safeBody = redact ? redactSecrets(body) : body;
   const attachments = message.attachment_ids?.length
@@ -55,14 +80,18 @@ function formatMessage(message, redact) {
   return `[${message.id}] ${message.date || "N/A"} - ${messageLabel(message)} - ${author}\n   ${safeBody || "(empty)"}${attachments}`;
 }
 
-export async function getMessageRows(executeKw, taskId, { includeSystem, limit }) {
+export async function getMessageRows(
+  executeKw: ExecuteKwImplementation,
+  taskId: number,
+  { includeSystem, limit }: { includeSystem: boolean; limit: number },
+): Promise<OdooRecord[]> {
   const domain = [
     ["model", "=", "project.task"],
     ["res_id", "=", taskId],
   ];
   if (!includeSystem) domain.push(["message_type", "!=", "notification"]);
 
-  return executeKw("mail.message", "search_read", [domain], {
+  return execute<OdooRecord[]>(executeKw, "mail.message", "search_read", [domain], {
     fields: [
       "id",
       "date",
@@ -79,8 +108,11 @@ export async function getMessageRows(executeKw, taskId, { includeSystem, limit }
   });
 }
 
-export async function getAttachmentRows(executeKw, taskId) {
-  const messages = await executeKw("mail.message", "search_read", [
+export async function getAttachmentRows(
+  executeKw: ExecuteKwImplementation,
+  taskId: number,
+): Promise<AttachmentRecord[]> {
+  const messages = await execute<OdooRecord[]>(executeKw, "mail.message", "search_read", [
     [
       ["model", "=", "project.task"],
       ["res_id", "=", taskId],
@@ -92,7 +124,8 @@ export async function getAttachmentRows(executeKw, taskId) {
   const messageAttachmentIds = [
     ...new Set(messages.flatMap((message) => message.attachment_ids || [])),
   ];
-  const taskAttachments = await executeKw(
+  const taskAttachments = await execute<AttachmentRecord[]>(
+    executeKw,
     "ir.attachment",
     "search_read",
     [
@@ -104,7 +137,7 @@ export async function getAttachmentRows(executeKw, taskId) {
     { fields: ATTACHMENT_FIELDS, limit: 500, order: "id desc" },
   );
   const messageAttachments = messageAttachmentIds.length
-    ? await executeKw("ir.attachment", "read", [
+    ? await execute<AttachmentRecord[]>(executeKw, "ir.attachment", "read", [
         messageAttachmentIds,
         ATTACHMENT_FIELDS,
       ])
@@ -113,18 +146,18 @@ export async function getAttachmentRows(executeKw, taskId) {
   const taskAttachmentIds = new Set(
     taskAttachments.map((attachment) => attachment.id),
   );
-  const sourceMessagesByAttachment = new Map();
+  const sourceMessagesByAttachment = new Map<number, SourceMessage[]>();
   for (const message of messages) {
     for (const attachmentId of message.attachment_ids || []) {
       if (!sourceMessagesByAttachment.has(attachmentId)) {
         sourceMessagesByAttachment.set(attachmentId, []);
       }
-      sourceMessagesByAttachment.get(attachmentId).push({
+      sourceMessagesByAttachment.get(attachmentId)!.push({
         id: message.id,
         date: message.date || null,
         author: {
-          id: message.author_id?.[0] || null,
-          name: message.author_id?.[1] || message.email_from || "System",
+          id: referenceId(message.author_id) || null,
+          name: referenceName(message.author_id) || message.email_from || "System",
         },
       });
     }
@@ -146,7 +179,7 @@ export async function getAttachmentRows(executeKw, taskId) {
   ];
 }
 
-function formatProvenance(attachment) {
+function formatProvenance(attachment: AttachmentRecord): string {
   const sources = attachment.provenance?.source_messages || [];
   const parts = [];
   if (attachment.provenance?.task_direct) parts.push("task-direct");
@@ -159,7 +192,9 @@ function formatProvenance(attachment) {
   return parts.join("; ") || "unknown";
 }
 
-export function normalizeAttachmentMetadata(attachment) {
+export function normalizeAttachmentMetadata<T extends AttachmentRecord>(
+  attachment: T,
+): Omit<T, "datas"> & { name: string; description: string; url: string } {
   const { datas: _datas, ...metadata } = attachment;
   return {
     ...metadata,
@@ -169,11 +204,14 @@ export function normalizeAttachmentMetadata(attachment) {
   };
 }
 
-function formatAttachment(attachment) {
+function formatAttachment(attachment: AttachmentRecord): string {
   const metadata = normalizeAttachmentMetadata(attachment);
-  const kind = attachment.mimetype?.startsWith("image/")
+  const mimetype = typeof attachment.mimetype === "string"
+    ? attachment.mimetype
+    : "";
+  const kind = mimetype.startsWith("image/")
     ? "image"
-    : attachment.mimetype?.startsWith("video/")
+    : mimetype.startsWith("video/")
       ? "video"
       : "file";
   const size = Number(attachment.file_size || 0);
@@ -184,13 +222,16 @@ function formatAttachment(attachment) {
   return `[${attachment.id}] ${metadata.name || "unnamed"} - ${kind} - ${attachment.mimetype || "unknown"} - ${size} bytes${source}\n   provenance: ${formatProvenance(attachment)}`;
 }
 
-function videoExtension(mimetype) {
+function videoExtension(mimetype: unknown): string {
   if (mimetype === "video/quicktime") return ".mov";
   if (mimetype === "video/webm") return ".webm";
   return ".mp4";
 }
 
-async function renderVideoFrames(row, frameCount) {
+async function renderVideoFrames(
+  row: AttachmentRecord & { datas: string },
+  frameCount: number,
+): Promise<{ duration: number; frames: { timestamp: number; data: string }[] }> {
   const directory = await mkdtemp(join(tmpdir(), "mcp-odoo-video-"));
   const inputPath = join(directory, `input${videoExtension(row.mimetype)}`);
   try {
@@ -212,7 +253,7 @@ async function renderVideoFrames(row, frameCount) {
     if (!Number.isFinite(duration) || duration <= 0) {
       throw new Error("Could not determine video duration");
     }
-    const frames = [];
+    const frames: { timestamp: number; data: string }[] = [];
     for (let index = 0; index < frameCount; index += 1) {
       const timestamp = ((index + 1) * duration) / (frameCount + 1);
       const outputPath = join(directory, `frame-${index + 1}.jpg`);
@@ -247,7 +288,7 @@ async function renderVideoFrames(row, frameCount) {
   }
 }
 
-function definitions() {
+function definitions(): Tool[] {
   return [
     {
       name: "odoo_get_ticket_messages",
@@ -328,8 +369,12 @@ function definitions() {
   ];
 }
 
-export function createTicketContentTools({ executeKw }) {
-  return {
+export function createTicketContentTools({
+  executeKw,
+}: {
+  executeKw: ExecuteKwImplementation;
+}) {
+  return defineToolGroup({
     definitions: definitions(),
     handlers: {
       async odoo_get_ticket_messages(args) {
@@ -373,13 +418,17 @@ export function createTicketContentTools({ executeKw }) {
         const limit = normalizeLimit(args.limit, 5, 10);
         const maxBytes = normalizeLimit(args.max_bytes, 5 * 1024 * 1024, 10 * 1024 * 1024);
         const candidates = attachments
-          .filter((attachment) => SUPPORTED_IMAGE_TYPES.has(attachment.mimetype))
+          .filter(
+            (attachment) =>
+              typeof attachment.mimetype === "string" &&
+              SUPPORTED_IMAGE_TYPES.has(attachment.mimetype),
+          )
           .slice(0, limit);
         const eligible = candidates.filter(
           (attachment) => Number(attachment.file_size || 0) <= maxBytes,
         );
         const rows = eligible.length
-          ? await executeKw("ir.attachment", "read", [
+          ? await execute<AttachmentRecord[]>(executeKw, "ir.attachment", "read", [
               eligible.map((attachment) => attachment.id),
               ["id", "name", "mimetype", "file_size", "datas"],
             ])
@@ -387,11 +436,11 @@ export function createTicketContentTools({ executeKw }) {
         const metadataById = new Map(
           eligible.map((attachment) => [attachment.id, attachment]),
         );
-        const content = [];
-        const images = [];
+        const content: CallToolResult["content"] = [];
+        const images: ReturnType<typeof normalizeAttachmentMetadata>[] = [];
 
         for (const row of rows) {
-          if (!row.datas) continue;
+          if (typeof row.datas !== "string" || !row.datas) continue;
           const metadata = metadataById.get(row.id);
           const rowMetadata = normalizeAttachmentMetadata(row);
           images.push(normalizeAttachmentMetadata(metadata || row));
@@ -402,7 +451,10 @@ export function createTicketContentTools({ executeKw }) {
           content.push({
             type: "image",
             data: row.datas,
-            mimeType: row.mimetype,
+            mimeType:
+              typeof row.mimetype === "string"
+                ? row.mimetype
+                : "application/octet-stream",
           });
         }
 
@@ -433,6 +485,7 @@ export function createTicketContentTools({ executeKw }) {
           : null;
         const video = attachments.find(
           (attachment) =>
+            typeof attachment.mimetype === "string" &&
             SUPPORTED_VIDEO_TYPES.has(attachment.mimetype) &&
             (!attachmentId || attachment.id === attachmentId),
         );
@@ -451,18 +504,20 @@ export function createTicketContentTools({ executeKw }) {
         if (Number(video.file_size || 0) > maxBytes) {
           throw new Error(`Video exceeds the ${maxBytes} byte limit`);
         }
-        const rows = await executeKw("ir.attachment", "read", [
+        const rows = await execute<AttachmentRecord[]>(executeKw, "ir.attachment", "read", [
           [video.id],
           ["id", "name", "mimetype", "file_size", "datas"],
         ]);
         const row = rows?.[0];
-        if (!row?.datas) throw new Error("Video content is not readable");
+        if (typeof row?.datas !== "string" || !row.datas) {
+          throw new Error("Video content is not readable");
+        }
         const rendered = await renderVideoFrames(
-          row,
+          { ...row, datas: row.datas },
           normalizeLimit(args.frames, 4, 8),
         );
         const rowMetadata = normalizeAttachmentMetadata(row);
-        const content = [
+        const content: CallToolResult["content"] = [
           {
             type: "text",
             text: `Video [${row.id}] ${rowMetadata.name || "unnamed"} - ${rendered.duration.toFixed(2)}s. Frames are visual samples; audio is not transcribed.\n   provenance: ${formatProvenance(video)}`,
@@ -490,5 +545,5 @@ export function createTicketContentTools({ executeKw }) {
         };
       },
     },
-  };
+  });
 }

@@ -1,10 +1,72 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type {
+  OdooArguments,
+  OdooKeywordArguments,
+} from "../src/contracts.js";
 import { createTicketContextTools } from "../src/tools/ticket-context.js";
+import {
+  array,
+  required,
+  structuredContent,
+} from "./helpers.js";
 
-function makeTools(routes = {}) {
-  const calls = [];
-  const executeKw = async (model, method, args, kwargs) => {
+interface OdooCall {
+  model: string;
+  method: string;
+  args: OdooArguments;
+  kwargs: OdooKeywordArguments;
+}
+
+interface RouteContext {
+  args: OdooArguments;
+  kwargs: OdooKeywordArguments;
+  calls: OdooCall[];
+}
+
+type Route = (context: RouteContext) => unknown | Promise<unknown>;
+type Routes = Record<string, Route>;
+
+interface TicketContextContent extends Record<string, unknown> {
+  ticket: { description: string };
+  messages: { body: string }[];
+  attachments: {
+    name: string;
+    description: string;
+    url: string;
+    provenance: {
+      task_direct: boolean;
+      source_messages: {
+        id?: number;
+        date: string | null;
+        author: { id: number | null; name: string };
+      }[];
+    };
+  }[];
+  gitlab_branches: { branch_name: string | null }[];
+  timesheets: {
+    line_count: number;
+    returned_line_count: number;
+    truncated: boolean;
+    total_hours: number;
+    lines: unknown[];
+  };
+  project_stages: unknown[];
+}
+
+interface NoteContent extends Record<string, unknown> {
+  verified: boolean;
+  message: { body: string } | null;
+}
+
+function makeTools(routes: Routes = {}) {
+  const calls: OdooCall[] = [];
+  const executeKw: Parameters<typeof createTicketContextTools>[0]["executeKw"] = async (
+    model,
+    method,
+    args = [],
+    kwargs = {},
+  ) => {
     calls.push({ model, method, args, kwargs });
     const route = routes[`${model}.${method}`];
     if (!route) throw new Error(`Unexpected call ${model}.${method}`);
@@ -101,6 +163,7 @@ test("odoo_add_ticket_note posts an internal note and verifies the message", asy
     body: "password: hidden",
     confirm: true,
   });
+  const data = structuredContent<NoteContent>(result);
 
   assert.deepEqual(calls[0], {
     model: "project.task",
@@ -112,8 +175,8 @@ test("odoo_add_ticket_note posts an internal note and verifies the message", asy
       message_type: "comment",
     },
   });
-  assert.equal(result.structuredContent.verified, true);
-  assert.equal(result.structuredContent.message.body, "password: [REDACTED]");
+  assert.equal(data.verified, true);
+  assert.equal(required(data.message).body, "password: [REDACTED]");
   assert.doesNotMatch(JSON.stringify(result), /hidden/);
 });
 
@@ -236,7 +299,7 @@ test("odoo_get_ticket_context aggregates redacted ticket evidence", async () => 
     include_system: true,
     message_limit: 4,
   });
-  const data = result.structuredContent;
+  const data = structuredContent<TicketContextContent>(result);
 
   assert.equal(data.ticket.description, "api key: [REDACTED]");
   assert.equal(data.messages[0].body, "");
@@ -293,7 +356,7 @@ test("odoo_get_ticket_context rejects another project before reading evidence", 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].model, "project.task");
   assert.deepEqual(calls[0].args, [[9], ["id", "project_id"]]);
-  assert.equal(calls[0].args[1].includes("description"), false);
+  assert.equal(array(calls[0].args[1]).includes("description"), false);
 });
 
 test("odoo_get_ticket_context validates scope before requesting full task fields", async () => {
@@ -305,7 +368,7 @@ test("odoo_get_ticket_context validates scope before requesting full task fields
         assert.deepEqual(args, [[9], ["id", "project_id"]]);
         return [{ id: 9, project_id: [12, "Support"] }];
       }
-      assert.equal(args[1].includes("description"), true);
+      assert.equal(array(args[1]).includes("description"), true);
       return [
         {
           id: 9,
@@ -333,7 +396,7 @@ test("odoo_get_ticket_context validates scope before requesting full task fields
   assert.equal(result.structuredContent.found, true);
   assert.equal(taskReadCount, 2);
   assert.deepEqual(calls[0].args[1], ["id", "project_id"]);
-  assert.equal(calls[1].args[1].includes("description"), true);
+  assert.equal(array(calls[1].args[1]).includes("description"), true);
 });
 
 test("odoo_get_ticket_context preserves scoped not-found behavior after minimal read", async () => {
@@ -378,7 +441,7 @@ test("odoo_get_ticket_context reports complete timesheet totals with capped rows
   });
 
   const result = await tools.handlers.odoo_get_ticket_context({ task_id: 9 });
-  const { timesheets } = result.structuredContent;
+  const { timesheets } = structuredContent<TicketContextContent>(result);
 
   assert.equal(timesheets.line_count, 1250);
   assert.equal(timesheets.returned_line_count, 2);
@@ -398,13 +461,13 @@ test("odoo_get_ticket_context reports complete timesheet totals with capped rows
     (call) =>
       call.model === "account.analytic.line" && call.method === "search_read",
   );
-  assert.deepEqual(countCall.args, [[["task_id", "=", 9]]]);
-  assert.deepEqual(aggregateCall.args, [
+  assert.deepEqual(required(countCall).args, [[["task_id", "=", 9]]]);
+  assert.deepEqual(required(aggregateCall).args, [
     [["task_id", "=", 9]],
     ["unit_amount:sum"],
     [],
   ]);
-  assert.deepEqual(aggregateCall.kwargs, { lazy: false });
-  assert.equal(rowsCall.kwargs.limit, 1000);
-  assert.equal(rowsCall.kwargs.order, "date desc, id desc");
+  assert.deepEqual(required(aggregateCall).kwargs, { lazy: false });
+  assert.equal(required(rowsCall).kwargs.limit, 1000);
+  assert.equal(required(rowsCall).kwargs.order, "date desc, id desc");
 });

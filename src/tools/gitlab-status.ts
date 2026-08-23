@@ -3,6 +3,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type {
+  ExecuteKwImplementation,
+  OdooArguments,
+  OdooKeywordArguments,
+  OdooRecord,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  errorMessage,
+  executeKw as execute,
+  isRecord,
+} from "../contracts.js";
+import type { FetchImplementation, FetchResponse } from "../odoo/client.js";
 import { formatList } from "../utils/format.js";
 import { positiveInt } from "../utils/args.js";
 
@@ -12,7 +25,58 @@ const DEFAULT_GITLAB_API_TIMEOUT_MS = 15000;
 const MIN_GITLAB_API_TIMEOUT_MS = 1000;
 const MAX_GITLAB_API_TIMEOUT_MS = 120000;
 
-function allowedGitLabHosts(env = process.env) {
+type Environment = Record<string, string | undefined>;
+
+export interface GitLabBranchRow extends OdooRecord {
+  gitlab_branch_name?: string | false | null;
+  target_branch?: string | false | null;
+  gitlab_link?: string | false | null;
+  merge_request_link?: string | boolean | null;
+}
+
+export interface BranchInspection {
+  status: string;
+  branch_exists?: boolean;
+  branch_sha?: string | null;
+  target_sha?: string | null;
+  merge_base_sha?: string;
+  branch_tree_sha?: string;
+  target_tree_sha?: string;
+  merge_base_tree_sha?: string;
+  tree_has_changes?: boolean;
+  ahead?: number;
+  behind?: number;
+  branch_has_changes?: boolean;
+  branch_empty?: boolean;
+  mr_iid?: number | null;
+  mr_ref_exists?: boolean;
+  error?: string;
+}
+
+export interface MergeRequestInspection {
+  api_status: string;
+  reason?: string;
+  http_status?: number;
+  iid?: number;
+  state?: string | null;
+  draft?: boolean;
+  merge_status?: string | null;
+  detailed_merge_status?: string | null;
+  has_conflicts?: boolean;
+  blocking_discussions_resolved?: unknown;
+  pipeline?: { status: string | null; url: string | null } | null;
+  head_pipeline?: { status: string | null; url: string | null } | null;
+  approvals?: Record<string, unknown>;
+}
+
+export type GitRunner = (args: string[]) => Promise<{ stdout: string }>;
+export type InspectBranch = (row: GitLabBranchRow) => Promise<BranchInspection>;
+export type InspectMergeRequest = (
+  link: unknown,
+  options?: { fetchImpl?: FetchImplementation; env?: Environment },
+) => Promise<MergeRequestInspection>;
+
+function allowedGitLabHosts(env: Environment = process.env): string[] {
   return (env.ODOO_GITLAB_ALLOWED_HOSTS || "gitlab.solunika.com")
     .split(",")
     .map((host) => host.trim().toLowerCase())
@@ -26,7 +90,7 @@ function gitTimeoutMs() {
     : DEFAULT_GIT_TIMEOUT_MS;
 }
 
-async function runGit(args) {
+async function runGit(args: string[]): Promise<{ stdout: string }> {
   return execFileAsync("git", args, {
     timeout: gitTimeoutMs(),
     maxBuffer: 1024 * 1024,
@@ -35,14 +99,15 @@ async function runGit(args) {
       GIT_TERMINAL_PROMPT: "0",
       GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
     },
+    encoding: "utf8",
   });
 }
 
-export function normalizeMergeRequestLink(value) {
+export function normalizeMergeRequestLink(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-export function remoteFromLink(link) {
+export function remoteFromLink(link: string): string {
   const url = new URL(link);
   if (!allowedGitLabHosts().includes(url.hostname.toLowerCase())) {
     throw new Error(`GitLab host '${url.hostname}' is not allowed`);
@@ -52,7 +117,7 @@ export function remoteFromLink(link) {
   return `git@${url.hostname}:${projectPath}.git`;
 }
 
-function gitLabApiTimeoutMs(env) {
+function gitLabApiTimeoutMs(env: Environment): number {
   const configured = Number(env.ODOO_GITLAB_API_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return DEFAULT_GITLAB_API_TIMEOUT_MS;
   return Math.min(
@@ -61,7 +126,7 @@ function gitLabApiTimeoutMs(env) {
   );
 }
 
-function mergeRequestApiDetails(link, env) {
+function mergeRequestApiDetails(link: string, env: Environment) {
   const url = new URL(link);
   if (url.protocol !== "https:") throw new Error("invalid_protocol");
   if (!allowedGitLabHosts(env).includes(url.hostname.toLowerCase())) {
@@ -75,15 +140,28 @@ function mergeRequestApiDetails(link, env) {
   return { base, iid };
 }
 
-function pipelineDetails(pipeline) {
-  if (!pipeline) return null;
+function pipelineDetails(
+  pipeline: unknown,
+): { status: string | null; url: string | null } | null {
+  if (!isRecord(pipeline)) return null;
   return {
-    status: pipeline.status || null,
-    url: pipeline.web_url || null,
+    status: typeof pipeline.status === "string" ? pipeline.status : null,
+    url: typeof pipeline.web_url === "string" ? pipeline.web_url : null,
   };
 }
 
-async function fetchGitLabJson(url, { fetchImpl, token, timeoutMs }) {
+type GitLabFetchResult =
+  | { ok: true; data: unknown }
+  | { ok: false; redirected?: boolean; status?: number };
+
+async function fetchGitLabJson(
+  url: string,
+  {
+    fetchImpl,
+    token,
+    timeoutMs,
+  }: { fetchImpl: FetchImplementation; token: string; timeoutMs: number },
+): Promise<GitLabFetchResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -94,11 +172,14 @@ async function fetchGitLabJson(url, { fetchImpl, token, timeoutMs }) {
     });
     if (
       response.type === "opaqueredirect" ||
-      (response.status >= 300 && response.status < 400)
+      (response.status !== undefined &&
+        response.status >= 300 &&
+        response.status < 400)
     ) {
       return { ok: false, redirected: true };
     }
     if (!response.ok) return { ok: false, status: response.status };
+    if (!response.json) return { ok: false, status: response.status };
     return { ok: true, data: await response.json() };
   } finally {
     clearTimeout(timeout);
@@ -106,9 +187,12 @@ async function fetchGitLabJson(url, { fetchImpl, token, timeoutMs }) {
 }
 
 export async function inspectGitLabMergeRequest(
-  link,
-  { fetchImpl = globalThis.fetch, env = process.env } = {},
-) {
+  link: unknown,
+  {
+    fetchImpl = globalThis.fetch,
+    env = process.env,
+  }: { fetchImpl?: FetchImplementation; env?: Environment } = {},
+): Promise<MergeRequestInspection> {
   const normalizedLink = normalizeMergeRequestLink(link);
   if (!normalizedLink) return { api_status: "no_merge_request" };
   const token = env.ODOO_GITLAB_TOKEN?.trim();
@@ -118,7 +202,7 @@ export async function inspectGitLabMergeRequest(
   try {
     details = mergeRequestApiDetails(normalizedLink, env);
   } catch (error) {
-    return { api_status: "unavailable", reason: error.message };
+    return { api_status: "unavailable", reason: errorMessage(error) };
   }
 
   const options = {
@@ -144,14 +228,19 @@ export async function inspectGitLabMergeRequest(
     };
   }
 
-  const mr = mergeRequestResponse.data;
-  const result = {
+  const mr = isRecord(mergeRequestResponse.data)
+    ? mergeRequestResponse.data
+    : {};
+  const result: MergeRequestInspection = {
     api_status: "available",
-    iid: mr.iid || details.iid,
-    state: mr.state || null,
+    iid: typeof mr.iid === "number" ? mr.iid : details.iid,
+    state: typeof mr.state === "string" ? mr.state : null,
     draft: Boolean(mr.draft ?? mr.work_in_progress),
-    merge_status: mr.merge_status || null,
-    detailed_merge_status: mr.detailed_merge_status || null,
+    merge_status: typeof mr.merge_status === "string" ? mr.merge_status : null,
+    detailed_merge_status:
+      typeof mr.detailed_merge_status === "string"
+        ? mr.detailed_merge_status
+        : null,
     has_conflicts: Boolean(mr.has_conflicts),
     blocking_discussions_resolved: mr.blocking_discussions_resolved ?? null,
     pipeline: pipelineDetails(mr.pipeline),
@@ -171,14 +260,24 @@ export async function inspectGitLabMergeRequest(
           : {}),
       };
     } else {
-      const approvals = approvalsResponse.data;
+      const approvals = isRecord(approvalsResponse.data)
+        ? approvalsResponse.data
+        : {};
+      const approvedBy = Array.isArray(approvals.approved_by)
+        ? approvals.approved_by
+        : [];
       result.approvals = {
         api_status: "available",
         approved: Boolean(approvals.approved),
         approvals_left: approvals.approvals_left ?? null,
-        approver_names: (approvals.approved_by || [])
-          .map((entry) => entry.user?.name)
-          .filter(Boolean),
+        approver_names: approvedBy
+          .map((entry) =>
+            isRecord(entry) && isRecord(entry.user) &&
+              typeof entry.user.name === "string"
+              ? entry.user.name
+              : null,
+          )
+          .filter((name): name is string => Boolean(name)),
       };
     }
   } catch {
@@ -187,7 +286,7 @@ export async function inspectGitLabMergeRequest(
   return result;
 }
 
-function parseRemoteRefs(stdout) {
+function parseRemoteRefs(stdout: string): Map<string, string> {
   return new Map(
     stdout
       .trim()
@@ -200,20 +299,35 @@ function parseRemoteRefs(stdout) {
 }
 
 export async function inspectGitLabBranch(
-  row,
-  { git = runGit, makeTempDir = () => mkdtemp(join(tmpdir(), "mcp-odoo-git-")), removeTempDir = (path) => rm(path, { recursive: true, force: true }) } = {},
-) {
+  row: GitLabBranchRow,
+  {
+    git = runGit,
+    makeTempDir = () => mkdtemp(join(tmpdir(), "mcp-odoo-git-")),
+    removeTempDir = (path: string) =>
+      rm(path, { recursive: true, force: true }),
+  }: {
+    git?: GitRunner;
+    makeTempDir?: () => Promise<string>;
+    removeTempDir?: (path: string) => Promise<unknown>;
+  } = {},
+): Promise<BranchInspection> {
   if (!row.gitlab_link) {
     return { branch_exists: false, mr_ref_exists: false, status: "not_created" };
   }
 
-  const remote = remoteFromLink(row.gitlab_link);
+  const remote = remoteFromLink(String(row.gitlab_link));
   const branchRef = `refs/heads/${row.gitlab_branch_name}`;
   const targetRef = `refs/heads/${row.target_branch}`;
   const mergeRequestLink = normalizeMergeRequestLink(row.merge_request_link);
   const mrIid = mergeRequestLink?.match(/\/merge_requests\/(\d+)(?:\/|$)/)?.[1];
   const mrRef = mrIid ? `refs/merge-requests/${mrIid}/head` : null;
-  const refs = [...new Set([branchRef, targetRef, mrRef].filter(Boolean))];
+  const refs = [
+    ...new Set(
+      [branchRef, targetRef, mrRef].filter(
+        (ref): ref is string => Boolean(ref),
+      ),
+    ),
+  ];
   const { stdout } = await git(["ls-remote", remote, ...refs]);
   const remoteRefs = parseRemoteRefs(stdout);
   const branchSha = remoteRefs.get(branchRef) || null;
@@ -311,13 +425,26 @@ export async function inspectGitLabBranch(
 }
 
 export function createGitLabStatusTools({
-  executeKw,
+  executeKw: executeKwImplementation,
   inspectBranch = inspectGitLabBranch,
   inspectMergeRequest = inspectGitLabMergeRequest,
   fetchImpl = globalThis.fetch,
   env = process.env,
+}: {
+  executeKw: ExecuteKwImplementation;
+  inspectBranch?: InspectBranch;
+  inspectMergeRequest?: InspectMergeRequest;
+  fetchImpl?: FetchImplementation;
+  env?: Environment;
 }) {
-  return {
+  const executeKw = <T = OdooRecord[]>(
+    model: string,
+    method: string,
+    args: OdooArguments = [],
+    kwargs: OdooKeywordArguments = {},
+  ) => execute<T>(executeKwImplementation, model, method, args, kwargs);
+
+  return defineToolGroup({
     definitions: [
       {
         name: "odoo_get_gitlab_status",
@@ -364,7 +491,10 @@ export function createGitLabStatusTools({
           try {
             branchStatus = await inspectBranch(row);
           } catch (error) {
-            branchStatus = { status: "verification_error", error: error.message };
+            branchStatus = {
+              status: "verification_error",
+              error: errorMessage(error),
+            };
           }
           let mergeRequest;
           try {
@@ -393,5 +523,5 @@ export function createGitLabStatusTools({
         };
       },
     },
-  };
+  });
 }

@@ -17,6 +17,15 @@ MCP server que permite interacturar con Odoo desde cualquier IDE compatible con 
 git clone https://github.com/Igabr13l/mcp-odoo.git
 cd mcp-odoo
 npm install
+npm run build
+```
+
+El servidor se compila en `dist/src`. Para desarrollo:
+
+```bash
+npm run typecheck
+npm test
+npm start
 ```
 
 ## Configuración por IDE
@@ -30,7 +39,7 @@ Agregar en `opencode.json` de tu workspace:
   "mcp": {
     "odoo": {
       "type": "local",
-      "command": ["node", "/ruta/absoluta/a/mcp-odoo/src/index.js"],
+      "command": ["node", "/ruta/absoluta/a/mcp-odoo/dist/src/index.js"],
       "enabled": true
     }
   }
@@ -46,7 +55,7 @@ Agregar en `cursor.json` o `claude_desktop_config.json`:
   "mcpServers": {
     "odoo": {
       "command": "node",
-      "args": ["/ruta/absoluta/a/mcp-odoo/src/index.js"]
+      "args": ["/ruta/absoluta/a/mcp-odoo/dist/src/index.js"]
     }
   }
 }
@@ -61,7 +70,7 @@ En settings.json:
   "mcpServers": {
     "odoo": {
       "command": "node",
-      "args": ["C:\\ruta\\a\\mcp-odoo\\src\\index.js"]
+      "args": ["C:\\ruta\\a\\mcp-odoo\\dist\\src\\index.js"]
     }
   }
 }
@@ -76,7 +85,7 @@ En `~/.windsurf/config.json` o en el archivo de configuración del proyecto:
   "mcp": {
     "odoo": {
       "type": "local",
-      "command": ["node", "/ruta/a/mcp-odoo/src/index.js"]
+      "command": ["node", "/ruta/a/mcp-odoo/dist/src/index.js"]
     }
   }
 }

@@ -1,14 +1,14 @@
-export function formatList(rows) {
+export function formatList(rows: string[] | null | undefined): string {
   if (!rows || rows.length === 0) return "No results";
   return rows.join("\n");
 }
 
-export function hasValue(value) {
+export function hasValue(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
 }
 
-export function decodeHtmlEntities(value) {
-  const namedEntities = {
+export function decodeHtmlEntities(value: unknown): string {
+  const namedEntities: Record<string, string> = {
     amp: "&",
     lt: "<",
     gt: ">",
@@ -30,7 +30,7 @@ export function decodeHtmlEntities(value) {
   });
 }
 
-export function htmlToText(html) {
+export function htmlToText(html: unknown): string {
   if (!hasValue(html) || html === false) return "";
 
   const text = String(html)
@@ -49,7 +49,7 @@ export function htmlToText(html) {
     .trim();
 }
 
-export function redactSecrets(value) {
+export function redactSecrets(value: unknown): string {
   if (!hasValue(value) || value === false) return "";
 
   return String(value)

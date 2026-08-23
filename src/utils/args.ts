@@ -1,4 +1,13 @@
-export function normalizeLimit(value, options = {}, legacyMaximum) {
+interface LimitOptions {
+  fallback?: number;
+  maximum?: number;
+}
+
+export function normalizeLimit(
+  value: unknown,
+  options: LimitOptions | number = {},
+  legacyMaximum?: number,
+): number {
   const normalizedOptions =
     typeof options === "object"
       ? options
@@ -11,7 +20,10 @@ export function normalizeLimit(value, options = {}, legacyMaximum) {
     : fallback;
 }
 
-export function positiveInt(value, options = {}) {
+export function positiveInt(
+  value: unknown,
+  options: { label?: string } | string = {},
+): number {
   const label = typeof options === "string" ? options : options.label || "value";
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {

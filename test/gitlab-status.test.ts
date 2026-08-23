@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExecuteKwImplementation } from "../src/contracts.js";
+import type { FetchImplementation } from "../src/odoo/client.js";
 import {
   createGitLabStatusTools,
+  type GitLabBranchRow,
+  type GitRunner,
   inspectGitLabBranch,
   inspectGitLabMergeRequest,
   normalizeMergeRequestLink,
   remoteFromLink,
 } from "../src/tools/gitlab-status.js";
+import { required } from "./helpers.js";
 
 const LINK = "https://gitlab.solunika.com/group/project/-/tree/feature";
 
-function row(overrides = {}) {
+function row(overrides: Partial<GitLabBranchRow> = {}): GitLabBranchRow {
   return {
     id: 7,
     gitlab_branch_name: "feature",
@@ -21,15 +26,23 @@ function row(overrides = {}) {
   };
 }
 
+interface FakeGitOptions {
+  refs?: string;
+  divergence?: string;
+  mergeBaseSha?: string;
+  treeShas?: string;
+  failOn?: string;
+}
+
 function fakeGit({
   refs,
   divergence = "0\t1\n",
   mergeBaseSha = "merge-base-commit\n",
   treeShas = "merge-base-tree\ntarget-tree\nbranch-tree\n",
   failOn,
-} = {}) {
-  const calls = [];
-  const git = async (args) => {
+}: FakeGitOptions = {}) {
+  const calls: string[][] = [];
+  const git: GitRunner = async (args) => {
     calls.push(args);
     if (failOn && args.includes(failOn)) throw new Error("git failed");
     if (args[0] === "ls-remote") return { stdout: refs || "" };
@@ -69,7 +82,7 @@ test("inspectGitLabBranch classifies active and empty branches from divergence",
     "bbbbbbbb\trefs/heads/uat",
   ].join("\n");
   const activeGit = fakeGit({ refs, divergence: "2\t3\n" });
-  const removed = [];
+  const removed: string[] = [];
   const active = await inspectGitLabBranch(row(), {
     git: activeGit.git,
     makeTempDir: async () => "/tmp/status-active",
@@ -197,7 +210,7 @@ test("inspectGitLabBranch cleans the temporary repository after Git failure", as
 
 test("inspectGitLabMergeRequest reports missing configuration without fetching", async () => {
   let calls = 0;
-  const fetchImpl = async () => {
+  const fetchImpl: FetchImplementation = async () => {
     calls += 1;
     throw new Error("network must not be used");
   };
@@ -216,8 +229,11 @@ test("inspectGitLabMergeRequest reports missing configuration without fetching",
 });
 
 test("inspectGitLabMergeRequest returns MR, pipeline, and approval details", async () => {
-  const calls = [];
-  const fetchImpl = async (url, options) => {
+  const calls: {
+    url: string;
+    options: Parameters<FetchImplementation>[1];
+  }[] = [];
+  const fetchImpl: FetchImplementation = async (url, options) => {
     calls.push({ url, options });
     if (url.endsWith("/approvals")) {
       return {
@@ -278,7 +294,7 @@ test("inspectGitLabMergeRequest returns MR, pipeline, and approval details", asy
     calls[0].url,
     "https://gitlab.solunika.com/api/v4/projects/group%2Fproject/merge_requests/42",
   );
-  assert.equal(calls[0].options.headers["PRIVATE-TOKEN"], "secret-token");
+  assert.equal(required(calls[0].options.headers)["PRIVATE-TOKEN"], "secret-token");
   assert.equal(calls[0].options.redirect, "manual");
   assert.ok(calls[0].options.signal instanceof AbortSignal);
   assert.doesNotMatch(JSON.stringify(result), /secret-token/);
@@ -286,8 +302,11 @@ test("inspectGitLabMergeRequest returns MR, pipeline, and approval details", asy
 
 test("inspectGitLabMergeRequest does not follow cross-origin redirects", async () => {
   const token = "redirect-secret-token";
-  const calls = [];
-  const fetchImpl = async (url, options) => {
+  const calls: {
+    url: string;
+    options: Parameters<FetchImplementation>[1];
+  }[] = [];
+  const fetchImpl: FetchImplementation = async (url, options) => {
     calls.push({ url, options });
     return {
       ok: false,
@@ -312,7 +331,7 @@ test("inspectGitLabMergeRequest does not follow cross-origin redirects", async (
 });
 
 test("inspectGitLabMergeRequest preserves MR data when approvals are unavailable", async () => {
-  const fetchImpl = async (url) =>
+  const fetchImpl: FetchImplementation = async (url) =>
     url.endsWith("/approvals")
       ? { ok: false, status: 403 }
       : {
@@ -338,6 +357,7 @@ test("inspectGitLabMergeRequest enforces allowed hosts before fetching", async (
     {
       fetchImpl: async () => {
         called = true;
+        return { ok: true };
       },
       env: { ODOO_GITLAB_TOKEN: "token" },
     },
@@ -351,7 +371,7 @@ test("inspectGitLabMergeRequest enforces allowed hosts before fetching", async (
 
 test("status tool returns structured classifications and verification errors", async () => {
   const rows = [row(), row({ id: 8, gitlab_branch_name: "broken" })];
-  const executeKw = async (model) =>
+  const executeKw: ExecuteKwImplementation = async (model) =>
     model === "project.task"
       ? [{ id: 1, name: "Task", gitlab_branch_ids: [7, 8] }]
       : rows;
@@ -378,7 +398,7 @@ test("status tool returns structured classifications and verification errors", a
 });
 
 test("status tool integrates MR inspection independently from branch verification", async () => {
-  const executeKw = async (model) =>
+  const executeKw: ExecuteKwImplementation = async (model) =>
     model === "project.task"
       ? [{ id: 1, gitlab_branch_ids: [7] }]
       : [

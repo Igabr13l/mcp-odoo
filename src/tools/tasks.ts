@@ -5,6 +5,22 @@ import {
   redactSecrets,
 } from "../utils/format.js";
 import { normalizeLimit, positiveInt } from "../utils/args.js";
+import type {
+  ExecuteKwImplementation,
+  GetAvailableFields,
+  GetNameMap,
+  GetSelectionLabelMap,
+  GetUid,
+  OdooArguments,
+  OdooKeywordArguments,
+  OdooRecord,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  executeKw as execute,
+  referenceId,
+  referenceName,
+} from "../contracts.js";
 
 const STATE_CANONICAL_NAMES = {
   in_progress: "In Progress",
@@ -12,16 +28,27 @@ const STATE_CANONICAL_NAMES = {
   done: "Done",
 };
 
-function getNamesFromMap(ids, nameMap) {
+function getNamesFromMap(
+  ids: number[] | undefined,
+  nameMap: Map<number, string>,
+): string[] {
   return (ids || []).map((id) => nameMap.get(Number(id)) || `#${id}`);
 }
 
-function formatSelectionValue(selectionMap, value, fallback = "N/A") {
+function formatSelectionValue(
+  selectionMap: Map<unknown, string>,
+  value: unknown,
+  fallback: unknown = "N/A",
+): unknown {
   if (!hasValue(value)) return fallback;
   return selectionMap.get(value) || value;
 }
 
-function formatTaskPriority(task, taskPriorityMap, priorityMap) {
+function formatTaskPriority(
+  task: OdooRecord,
+  taskPriorityMap: Map<unknown, string>,
+  priorityMap: Map<unknown, string>,
+): unknown {
   if (hasValue(task?.task_priority)) {
     return formatSelectionValue(
       taskPriorityMap,
@@ -33,10 +60,18 @@ function formatTaskPriority(task, taskPriorityMap, priorityMap) {
   return formatSelectionValue(priorityMap, task?.priority, "N/A");
 }
 
-function canonicalStageName({ state, stageName }) {
-  if (stageName) return stageName;
+function canonicalStageName({
+  state,
+  stageName,
+}: {
+  state?: unknown;
+  stageName?: unknown;
+}): string | null {
+  if (stageName) return String(stageName);
   if (!state) return null;
-  const canonical = STATE_CANONICAL_NAMES[state];
+  const canonical = typeof state === "string"
+    ? STATE_CANONICAL_NAMES[state as keyof typeof STATE_CANONICAL_NAMES]
+    : undefined;
   if (!canonical) {
     throw new Error(
       `Unknown state shortcut: "${state}" (expected in_progress | to_do | done)`,
@@ -45,7 +80,19 @@ function canonicalStageName({ state, stageName }) {
   return canonical;
 }
 
-async function resolveTaskStageId(executeKw, { projectId, state, stageName }) {
+async function resolveTaskStageId(
+  executeKw: <T = OdooRecord[]>(
+    model: string,
+    method: string,
+    args?: OdooArguments,
+    kwargs?: OdooKeywordArguments,
+  ) => Promise<T>,
+  {
+    projectId,
+    state,
+    stageName,
+  }: { projectId?: number; state?: unknown; stageName?: unknown },
+): Promise<number | null> {
   const targetName = canonicalStageName({ state, stageName });
   if (!targetName) return null;
 
@@ -101,8 +148,20 @@ async function resolveTaskStageId(executeKw, { projectId, state, stageName }) {
   );
 }
 
-function buildTaskDomain({ uid, projectId, stageName, mine = true, search }) {
-  const domain = [];
+function buildTaskDomain({
+  uid,
+  projectId,
+  stageName,
+  mine = true,
+  search,
+}: {
+  uid: number | null;
+  projectId: number | null;
+  stageName: string | null;
+  mine?: boolean;
+  search?: unknown;
+}): unknown[][] {
+  const domain: unknown[][] = [];
   if (mine) domain.push(["user_ids", "=", uid]);
   if (projectId) domain.push(["project_id", "=", Number(projectId)]);
   if (stageName) domain.push(["stage_id.name", "=ilike", stageName]);
@@ -111,13 +170,26 @@ function buildTaskDomain({ uid, projectId, stageName, mine = true, search }) {
 }
 
 export function createTaskTools({
-  executeKw,
+  executeKw: executeKwImplementation,
   getUid,
   getAvailableFields,
   getSelectionLabelMap,
   getNameMap,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getUid: GetUid;
+  getAvailableFields: GetAvailableFields;
+  getSelectionLabelMap: GetSelectionLabelMap;
+  getNameMap: GetNameMap;
 }) {
-  return {
+  const executeKw = <T = OdooRecord[]>(
+    model: string,
+    method: string,
+    args: OdooArguments = [],
+    kwargs: OdooKeywordArguments = {},
+  ) => execute<T>(executeKwImplementation, model, method, args, kwargs);
+
+  return defineToolGroup({
     definitions: [
       {
         name: "odoo_get_my_tasks",
@@ -215,7 +287,7 @@ export function createTaskTools({
               text: formatList(
                 tasks.map(
                   (t) =>
-                    `[${t.id}] ${t.name}\n   ${t.project_id?.[1] || "N/A"} - ${t.stage_id?.[1] || "N/A"}`,
+                    `[${t.id}] ${t.name}\n   ${referenceName(t.project_id) || "N/A"} - ${referenceName(t.stage_id) || "N/A"}`,
                 ),
               ),
             },
@@ -278,7 +350,7 @@ export function createTaskTools({
                 priorityMap,
               );
 
-              return `[${t.id}] ${t.name}\n   ${t.project_id?.[1] || "N/A"} - ${t.stage_id?.[1] || "N/A"} - priority:${priority} - tags:${tagNames.join(", ") || "none"} - deadline:${t.date_deadline || "N/A"}`;
+               return `[${t.id}] ${t.name}\n   ${referenceName(t.project_id) || "N/A"} - ${referenceName(t.stage_id) || "N/A"} - priority:${priority} - tags:${tagNames.join(", ") || "none"} - deadline:${t.date_deadline || "N/A"}`;
             },
           ),
         );
@@ -332,8 +404,8 @@ export function createTaskTools({
 
         const text = [
           `Task #${t.id}: ${t.name}`,
-          `Project: ${t.project_id?.[1] || "N/A"}`,
-          `Stage: ${t.stage_id?.[1] || "N/A"}`,
+          `Project: ${referenceName(t.project_id) || "N/A"}`,
+          `Stage: ${referenceName(t.stage_id) || "N/A"}`,
           `Assignees: ${assignees}`,
           `Tags: ${tags}`,
           `Priority: ${formatTaskPriority(t, taskPriorityMap, priorityMap)}`,
@@ -352,7 +424,7 @@ export function createTaskTools({
 
       async odoo_update_task(args) {
         const taskId = positiveInt(args.task_id, "task_id");
-        const values = {};
+        const values: Record<string, unknown> = {};
 
         const currentRows = await executeKw("project.task", "read", [
           [taskId],
@@ -362,7 +434,7 @@ export function createTaskTools({
           return { content: [{ type: "text", text: "Task not found" }] };
         }
         const current = currentRows[0];
-        const projectId = current.project_id?.[0];
+        const projectId = referenceId(current.project_id);
 
         if (args.assignee_user_ids !== undefined) {
           const assigneeIds = Array.isArray(args.assignee_user_ids)
@@ -392,7 +464,10 @@ export function createTaskTools({
           return { content: [{ type: "text", text: "Nothing to update" }] };
         }
 
-        const ok = await executeKw("project.task", "write", [[taskId], values]);
+        const ok = await executeKw<boolean>("project.task", "write", [
+          [taskId],
+          values,
+        ]);
         if (!ok) {
           return { content: [{ type: "text", text: "Update failed" }] };
         }
@@ -414,8 +489,8 @@ export function createTaskTools({
 
         const text = [
           `Task updated: #${updated?.id || taskId} ${updated?.name || ""}`,
-          `Project: ${updated?.project_id?.[1] || "N/A"}`,
-          `Stage: ${updated?.stage_id?.[1] || "N/A"}`,
+          `Project: ${referenceName(updated?.project_id) || "N/A"}`,
+          `Stage: ${referenceName(updated?.stage_id) || "N/A"}`,
           `Assignees: ${assignees}`,
           `Description: ${updated?.description ? "updated" : "empty"}`,
         ].join("\n");
@@ -424,5 +499,5 @@ export function createTaskTools({
       },
 
     },
-  };
+  });
 }

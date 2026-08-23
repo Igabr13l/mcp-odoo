@@ -1,9 +1,27 @@
 import { formatList } from "../utils/format.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { normalizeLimit, positiveInt } from "../utils/args.js";
 import {
+  type BranchInspection,
+  type GitLabBranchRow,
+  type InspectBranch,
   inspectGitLabBranch,
   normalizeMergeRequestLink,
 } from "./gitlab-status.js";
+import type {
+  ExecuteKwImplementation,
+  GetUid,
+  OdooArguments,
+  OdooKeywordArguments,
+  OdooRecord,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  errorMessage,
+  executeKw as execute,
+  referenceId,
+  referenceName,
+} from "../contracts.js";
 
 const BRANCH_FIELDS = [
   "id",
@@ -18,8 +36,15 @@ const BRANCH_FIELDS = [
 
 const MAX_BRANCH_NAME_LENGTH = 120;
 
-async function readTaskBranches(executeKw, taskId) {
-  const taskRows = await executeKw("project.task", "read", [
+type GenericExecuteKw = <T = OdooRecord[]>(
+  model: string,
+  method: string,
+  args?: OdooArguments,
+  kwargs?: OdooKeywordArguments,
+) => Promise<T>;
+
+async function readTaskBranches(executeKw: GenericExecuteKw, taskId: number) {
+  const taskRows = await executeKw<OdooRecord[]>("project.task", "read", [
     [taskId],
     ["id", "name", "gitlab_branch_ids"],
   ]);
@@ -28,21 +53,27 @@ async function readTaskBranches(executeKw, taskId) {
 
   const branchIds = task.gitlab_branch_ids || [];
   const branches = branchIds.length
-    ? await executeKw("gitlab.task.branch", "read", [branchIds, BRANCH_FIELDS])
+    ? await executeKw<GitLabBranchRow[]>("gitlab.task.branch", "read", [
+        branchIds,
+        BRANCH_FIELDS,
+      ])
     : [];
   return { task, branches };
 }
 
-async function readBranchRow(executeKw, gitlabTaskBranchId) {
-  const rows = await executeKw("gitlab.task.branch", "read", [
+async function readBranchRow(
+  executeKw: GenericExecuteKw,
+  gitlabTaskBranchId: number,
+): Promise<GitLabBranchRow | null> {
+  const rows = await executeKw<GitLabBranchRow[]>("gitlab.task.branch", "read", [
     [gitlabTaskBranchId],
     BRANCH_FIELDS,
   ]);
   return rows?.[0] || null;
 }
 
-function defaultBranchName(taskId, taskName) {
-  const fallbackSlug = (taskName || "")
+function defaultBranchName(taskId: number, taskName: unknown): string {
+  const fallbackSlug = String(taskName || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "")
@@ -50,9 +81,9 @@ function defaultBranchName(taskId, taskName) {
   return `odoo/${taskId}-${fallbackSlug || "task"}`;
 }
 
-function formatBranchRow(branch) {
-  const project = branch.gitlab_origin_project_id?.[1] || "N/A";
-  const owner = branch.gitlab_user_id?.[1] || "N/A";
+function formatBranchRow(branch: GitLabBranchRow): string {
+  const project = referenceName(branch.gitlab_origin_project_id) || "N/A";
+  const owner = referenceName(branch.gitlab_user_id) || "N/A";
   return [
     `[${branch.id}] ${project}`,
     `   branch: ${branch.gitlab_branch_name || "N/A"}`,
@@ -63,7 +94,7 @@ function formatBranchRow(branch) {
   ].join("\n");
 }
 
-function definitions() {
+function definitions(): Tool[] {
   return [
     {
       name: "odoo_get_task_gitlab_branches",
@@ -176,13 +207,23 @@ function definitions() {
 }
 
 export function createGitLabTools({
-  executeKw,
+  executeKw: executeKwImplementation,
   getUid,
   inspectBranch = inspectGitLabBranch,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getUid?: GetUid;
+  inspectBranch?: InspectBranch;
 }) {
+  const executeKw: GenericExecuteKw = <T = OdooRecord[]>(
+    model: string,
+    method: string,
+    args: OdooArguments = [],
+    kwargs: OdooKeywordArguments = {},
+  ) => execute<T>(executeKwImplementation, model, method, args, kwargs);
   const currentUid = getUid || (() => null);
 
-  return {
+  return defineToolGroup({
     definitions: definitions(),
     handlers: {
       async odoo_get_task_gitlab_branches(args) {
@@ -214,12 +255,16 @@ export function createGitLabTools({
       async odoo_gitlab_list_projects(args) {
         const query = (args.query || "").toString();
         const limit = normalizeLimit(args.limit, { fallback: 20 });
-        const rows = await executeKw("gitlab.project", "name_search", [
+        const rows = await executeKw<[number, string][]>(
+          "gitlab.project",
+          "name_search",
+          [
           query,
           [],
           "ilike",
           limit,
-        ]);
+          ],
+        );
         const text = formatList((rows || []).map((r) => `[${r[0]}] ${r[1]}`));
         return { content: [{ type: "text", text }] };
       },
@@ -227,7 +272,7 @@ export function createGitLabTools({
       async odoo_gitlab_list_users(args) {
         const query = (args.query || "").toString();
         const limit = normalizeLimit(args.limit, { fallback: 20 });
-        const rows = await executeKw("res.users", "name_search", [
+        const rows = await executeKw<[number, string][]>("res.users", "name_search", [
           query,
           [],
           "ilike",
@@ -260,7 +305,7 @@ export function createGitLabTools({
 
         const existing = linked.branches.find(
           (row) =>
-            row.gitlab_origin_project_id?.[0] === gitlabProjectId &&
+            referenceId(row.gitlab_origin_project_id) === gitlabProjectId &&
             row.gitlab_branch_name === branchName &&
             row.from_branch === fromBranch &&
             row.target_branch === targetBranch,
@@ -301,7 +346,7 @@ export function createGitLabTools({
           };
         }
 
-        const gitlabTaskBranchId = await executeKw(
+        const gitlabTaskBranchId = await executeKw<number>(
           "gitlab.task.branch",
           "create",
           [
@@ -316,17 +361,21 @@ export function createGitLabTools({
           ],
         );
 
-        const created = await executeKw("gitlab.task.branch", "read", [
+        const created = await executeKw<GitLabBranchRow[]>(
+          "gitlab.task.branch",
+          "read",
+          [
           [gitlabTaskBranchId],
           BRANCH_FIELDS,
-        ]);
+          ],
+        );
         const c = created?.[0];
         const text = [
           `GitLab task branch row created: ${c?.id || gitlabTaskBranchId}`,
-          `project: ${c?.gitlab_origin_project_id?.[1] || gitlabProjectId}`,
+          `project: ${referenceName(c?.gitlab_origin_project_id) || gitlabProjectId}`,
           `branch: ${c?.gitlab_branch_name || branchName}`,
           `from -> target: ${c?.from_branch || fromBranch} -> ${c?.target_branch || targetBranch}`,
-          `reviewer: ${c?.gitlab_user_id?.[1] || reviewerUserId}`,
+          `reviewer: ${referenceName(c?.gitlab_user_id) || reviewerUserId}`,
         ].join("\n");
 
         return {
@@ -379,7 +428,7 @@ export function createGitLabTools({
           };
         }
 
-        let result;
+        let result: unknown;
         try {
           result = await executeKw(
             "gitlab.task.branch",
@@ -388,10 +437,10 @@ export function createGitLabTools({
             {},
           );
         } catch (err) {
-          if (!(err?.message || "").toLowerCase().includes("branch already exists")) {
+          if (!errorMessage(err).toLowerCase().includes("branch already exists")) {
             throw err;
           }
-          await executeKw("gitlab.task.branch", "write", [
+          await executeKw<boolean>("gitlab.task.branch", "write", [
             [gitlabTaskBranchId],
             { gitlab_branch_name: baseName },
           ]);
@@ -407,7 +456,7 @@ export function createGitLabTools({
         }
 
         const row = await readBranchRow(executeKw, gitlabTaskBranchId);
-        const r = row || {};
+        const r: Partial<GitLabBranchRow> = row || {};
         const text = [
           `create_branch result: ${result}`,
           `branch_id: ${gitlabTaskBranchId}`,
@@ -453,11 +502,11 @@ export function createGitLabTools({
             },
           };
         }
-        let divergence;
+        let divergence: BranchInspection;
         try {
           divergence = await inspectBranch(current);
         } catch (error) {
-          throw new Error(`Unable to verify branch divergence: ${error.message}`);
+          throw new Error(`Unable to verify branch divergence: ${errorMessage(error)}`);
         }
         if (divergence.status === "branch_empty" || divergence.branch_empty) {
           throw new Error(
@@ -496,7 +545,7 @@ export function createGitLabTools({
         if (!result) throw new Error("Odoo did not create the merge request");
 
         const row = await readBranchRow(executeKw, gitlabTaskBranchId);
-        const r = row || {};
+        const r: Partial<GitLabBranchRow> = row || {};
         const text = [
           `create_merge_request result: ${result}`,
           `branch_id: ${gitlabTaskBranchId}`,
@@ -515,5 +564,5 @@ export function createGitLabTools({
         };
       },
     },
-  };
+  });
 }

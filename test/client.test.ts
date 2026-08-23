@@ -6,9 +6,16 @@ import test from "node:test";
 import {
   createOdooClient,
   OdooRequestError,
+  type FetchImplementation,
+  type FetchResponse,
+  type OdooClient,
 } from "../src/odoo/client.js";
+import { deferred } from "./helpers.js";
 
-async function withStoredClient(fetchImpl, callback) {
+async function withStoredClient(
+  fetchImpl: FetchImplementation,
+  callback: (client: OdooClient) => Promise<void>,
+) {
   const directory = await mkdtemp(join(tmpdir(), "mcp-odoo-client-"));
   const sessionFile = join(directory, "session.json");
   await writeFile(
@@ -33,7 +40,7 @@ async function withStoredClient(fetchImpl, callback) {
   }
 }
 
-function jsonResponse(body) {
+function jsonResponse(body: unknown): FetchResponse {
   return {
     ok: true,
     status: 200,
@@ -55,18 +62,13 @@ test("logout invalidates an authentication already in flight", async () => {
       password: "password",
     }),
   );
-  let resolveResponse;
-  let markStarted;
-  const started = new Promise((resolve) => {
-    markStarted = resolve;
-  });
+  const response = deferred<unknown>();
+  const started = deferred<void>();
   const fetchImpl = async () => {
-    markStarted();
+    started.resolve();
     return {
       ok: true,
-      json: () => new Promise((resolve) => {
-        resolveResponse = resolve;
-      }),
+      json: () => response.promise,
     };
   };
   const client = createOdooClient({
@@ -76,9 +78,9 @@ test("logout invalidates an authentication already in flight", async () => {
 
   try {
     const authentication = client.ensureAuthenticated();
-    await started;
+    await started.promise;
     await client.logout();
-    resolveResponse({ result: 16 });
+    response.resolve({ result: 16 });
     await assert.rejects(authentication, /cancelled by logout/);
     const session = await client.getSession();
     assert.equal(session.active, false);
@@ -245,7 +247,11 @@ test("mutating executeKw is never retried and marks transport outcome uncertain"
 });
 
 test("classifies HTTP and invalid JSON responses", async () => {
-  const responses = [
+  const responses: {
+    response: FetchResponse;
+    code: string;
+    retryable: boolean;
+  }[] = [
     {
       response: { ok: false, status: 503, statusText: "Unavailable" },
       code: "HTTP_ERROR",
@@ -265,6 +271,7 @@ test("classifies HTTP and invalid JSON responses", async () => {
   for (const { response, code, retryable } of responses) {
     await withStoredClient(async () => response, async (client) => {
       await assert.rejects(client.executeKw("res.users", "read"), (error) => {
+        assert.ok(error instanceof OdooRequestError);
         assert.equal(error.code, code);
         assert.equal(error.retryable, retryable);
         assert.equal(error.outcome, "failed");
@@ -327,6 +334,7 @@ test("retryable HTTP mutation failures require verification without retry", asyn
     return { ok: false, status: 503, statusText: "Unavailable" };
   }, async (client) => {
     await assert.rejects(client.executeKw("x.model", "create"), (error) => {
+      assert.ok(error instanceof OdooRequestError);
       assert.equal(error.code, "HTTP_ERROR");
       assert.equal(error.retryable, true);
       assert.equal(error.outcome, "uncertain");
@@ -349,6 +357,7 @@ test("invalid JSON after a mutation requires verification without retry", async 
     };
   }, async (client) => {
     await assert.rejects(client.executeKw("x.model", "create"), (error) => {
+      assert.ok(error instanceof OdooRequestError);
       assert.equal(error.code, "INVALID_JSON");
       assert.equal(error.retryable, false);
       assert.equal(error.outcome, "uncertain");
@@ -365,6 +374,7 @@ test("missing authentication has stable classified properties", async () => {
     fetchImpl: async () => assert.fail("fetch should not be called"),
   });
   await assert.rejects(client.executeKw("res.users", "read"), (error) => {
+    assert.ok(error instanceof OdooRequestError);
     assert.equal(error.code, "AUTHENTICATION_ERROR");
     assert.equal(error.retryable, false);
     assert.equal(error.outcome, "failed");

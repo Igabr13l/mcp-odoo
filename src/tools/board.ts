@@ -1,8 +1,48 @@
+import type {
+  ExecuteKwImplementation,
+  GetAvailableFields,
+  GetNameMap,
+  GetUid,
+  OdooRecord,
+} from "../contracts.js";
+import {
+  defineToolGroup,
+  executeKw as execute,
+  referenceId,
+  referenceName,
+} from "../contracts.js";
 import { formatList } from "../utils/format.js";
 import { normalizeLimit, positiveInt } from "../utils/args.js";
 
-function progressPercentage(value) {
+function progressPercentage(value: unknown): number {
   return Math.round(Number(value) || 0);
+}
+
+interface BoardTask {
+  id: number | undefined;
+  name: string | false | null | undefined;
+  sequence: number | false | null | undefined;
+  priority: string;
+  tags: string[];
+  hours: { allocated: number; spent: number; remaining: number };
+  progress_percent: number;
+  deadline: string | null;
+  subtasks: { closed: number; total: number };
+  blocked_by_ids: number[];
+  blocking_ids: number[];
+  milestone: string | null;
+  customer: string | null;
+  rejected_count: number;
+  rejection_date: string | null;
+  gitlab_branch_ids: number[];
+}
+
+interface BoardGroup {
+  stage_id: number | null;
+  stage: string;
+  sequence: number;
+  folded: boolean;
+  tasks: BoardTask[];
 }
 
 export function createBoardTools({
@@ -10,8 +50,13 @@ export function createBoardTools({
   getAvailableFields,
   getNameMap,
   getUid,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getAvailableFields: GetAvailableFields;
+  getNameMap: GetNameMap;
+  getUid: GetUid;
 }) {
-  return {
+  return defineToolGroup({
     definitions: [
       {
         name: "odoo_get_my_board",
@@ -61,38 +106,50 @@ export function createBoardTools({
           "gitlab_branch_ids",
         ];
         const fields = await getAvailableFields("project.task", requestedFields);
-        const domain = [
+        const domain: unknown[][] = [
           ["user_ids", "=", getUid()],
           ["project_id", "=", projectId],
         ];
         if (args.include_closed !== true && fields.includes("is_closed")) {
           domain.push(["is_closed", "=", false]);
         }
-        const rows = await executeKw("project.task", "search_read", [domain], {
-          fields,
-          limit: normalizeLimit(args.limit, { fallback: 100, maximum: 500 }),
-          order: "sequence, priority desc, id desc",
-        });
-        const stageIds = [
-          ...new Set(rows.map((row) => row.stage_id?.[0]).filter(Boolean)),
-        ];
+        const rows = await execute<OdooRecord[]>(
+          executeKw,
+          "project.task",
+          "search_read",
+          [domain],
+          {
+            fields,
+            limit: normalizeLimit(args.limit, { fallback: 100, maximum: 500 }),
+            order: "sequence, priority desc, id desc",
+          },
+        );
+        const stageIds: number[] = [
+          ...new Set(rows.map((row) => referenceId(row.stage_id)).filter(Boolean)),
+        ] as number[];
         const stageRows = stageIds.length
-          ? await executeKw("project.task.type", "read", [
+          ? await execute<OdooRecord[]>(executeKw, "project.task.type", "read", [
               stageIds,
               ["id", "name", "sequence", "fold"],
             ])
           : [];
-        const stageMap = new Map(stageRows.map((stage) => [stage.id, stage]));
+        const stageMap = new Map<number, OdooRecord>(
+          stageRows
+            .filter((stage): stage is OdooRecord & { id: number } => stage.id !== undefined)
+            .map((stage) => [stage.id, stage]),
+        );
         const tagMap = await getNameMap(
           "project.tags",
           rows.flatMap((row) => row.tag_ids || []),
         );
-        const groups = new Map();
+        const groups = new Map<number | string, BoardGroup>();
 
         for (const row of rows) {
-          const stageId = row.stage_id?.[0];
-          const stageMetadata = stageMap.get(stageId);
-          const stage = row.stage_id?.[1] || "No stage";
+          const stageId = referenceId(row.stage_id);
+          const stageMetadata = stageId === undefined
+            ? undefined
+            : stageMap.get(stageId);
+          const stage = referenceName(row.stage_id) || "No stage";
           const task = {
             id: row.id,
             name: row.name,
@@ -112,8 +169,8 @@ export function createBoardTools({
             },
             blocked_by_ids: row.depend_on_ids || [],
             blocking_ids: row.dependent_ids || [],
-            milestone: row.milestone_id?.[1] || null,
-            customer: row.partner_id?.[1] || null,
+            milestone: referenceName(row.milestone_id) || null,
+            customer: referenceName(row.partner_id) || null,
             rejected_count: Number(row.rejected_count || 0),
             rejection_date: row.rejection_date || null,
             gitlab_branch_ids: row.gitlab_branch_ids || [],
@@ -123,12 +180,12 @@ export function createBoardTools({
             groups.set(groupKey, {
               stage_id: stageId || null,
               stage,
-              sequence: stageMetadata?.sequence ?? 9999,
+              sequence: Number(stageMetadata?.sequence ?? 9999),
               folded: Boolean(stageMetadata?.fold),
               tasks: [],
             });
           }
-          groups.get(groupKey).tasks.push(task);
+          groups.get(groupKey)!.tasks.push(task);
         }
 
         const board = [...groups.values()]
@@ -158,5 +215,5 @@ export function createBoardTools({
         };
       },
     },
-  };
+  });
 }

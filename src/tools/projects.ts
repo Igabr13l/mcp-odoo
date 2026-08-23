@@ -1,7 +1,20 @@
+import type { ExecuteKwImplementation, GetUid, OdooRecord } from "../contracts.js";
+import {
+  defineToolGroup,
+  executeKw as execute,
+  referenceId,
+  referenceName,
+} from "../contracts.js";
 import { formatList } from "../utils/format.js";
 
-export function createProjectTools({ executeKw, getUid }) {
-  return {
+export function createProjectTools({
+  executeKw,
+  getUid,
+}: {
+  executeKw: ExecuteKwImplementation;
+  getUid: GetUid;
+}) {
+  return defineToolGroup({
     definitions: [
       {
         name: "odoo_get_projects",
@@ -15,8 +28,9 @@ export function createProjectTools({ executeKw, getUid }) {
       },
     ],
     handlers: {
-      async odoo_get_projects() {
-        const projects = await executeKw(
+      async odoo_get_projects(_args) {
+        const projects = await execute(
+          executeKw,
           "project.project",
           "search_read",
           [[["active", "=", true]]],
@@ -35,8 +49,9 @@ export function createProjectTools({ executeKw, getUid }) {
         };
       },
 
-      async odoo_get_my_projects() {
-        const tasks = await executeKw(
+      async odoo_get_my_projects(_args) {
+        const tasks = await execute<OdooRecord[]>(
+          executeKw,
           "project.task",
           "search_read",
           [[["user_ids", "=", getUid()]]],
@@ -46,10 +61,10 @@ export function createProjectTools({ executeKw, getUid }) {
           },
         );
 
-        const seen = new Map();
+        const seen = new Map<number, string>();
         for (const task of tasks || []) {
-          const projectId = task?.project_id?.[0];
-          const projectName = task?.project_id?.[1];
+          const projectId = referenceId(task.project_id);
+          const projectName = referenceName(task.project_id);
           if (!projectId || !projectName || seen.has(projectId)) continue;
           seen.set(projectId, projectName);
         }
@@ -61,5 +76,5 @@ export function createProjectTools({ executeKw, getUid }) {
         return { content: [{ type: "text", text: formatList(list) }] };
       },
     },
-  };
+  });
 }

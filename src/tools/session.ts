@@ -1,4 +1,9 @@
-function definitions() {
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { OdooRecord } from "../contracts.js";
+import type { OdooClient } from "../odoo/client.js";
+import { defineToolGroup } from "../contracts.js";
+
+function definitions(): Tool[] {
   return [
     {
       name: "odoo_login",
@@ -33,18 +38,33 @@ function definitions() {
   ];
 }
 
-export function createSessionTools(client) {
-  return {
+export function createSessionTools(
+  client: Pick<
+    OdooClient,
+    | "authenticate"
+    | "ensureAuthenticated"
+    | "executeKw"
+    | "getSession"
+    | "logout"
+  >,
+) {
+  return defineToolGroup({
     definitions: definitions(),
     handlers: {
       async odoo_login(args) {
-        const auth = await client.authenticate(args);
+        const auth = await client.authenticate(args as {
+          url?: string;
+          db?: string;
+          login: string;
+          password: string;
+          remember?: boolean;
+        });
         const session = await client.getSession();
         return {
           content: [{ type: "text", text: `Connected: ${auth.name} (${auth.login}) uid=${auth.uid} db=${session.db}` }],
         };
       },
-      async odoo_session_status() {
+      async odoo_session_status(_args) {
         const session = await client.getSession();
         const text = `active=${session.active} stored=${session.stored} verified=${session.verified} login=${session.login || "none"} uid=${session.uid ?? "none"} db=${session.db || "none"} url=${session.url || "none"}`;
         return {
@@ -52,10 +72,10 @@ export function createSessionTools(client) {
           structuredContent: session,
         };
       },
-      async odoo_whoami() {
+      async odoo_whoami(_args) {
         await client.ensureAuthenticated();
         const currentSession = await client.getSession();
-        const users = await client.executeKw(
+        const users = await client.executeKw<OdooRecord[]>(
           "res.users",
           "read",
           [[currentSession.uid], ["name", "login"]],
@@ -67,10 +87,10 @@ export function createSessionTools(client) {
           structuredContent: session,
         };
       },
-      async odoo_logout() {
+      async odoo_logout(_args) {
         await client.logout();
         return { content: [{ type: "text", text: "Session cleared" }] };
       },
     },
-  };
+  });
 }
