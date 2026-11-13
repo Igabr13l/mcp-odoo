@@ -110,7 +110,10 @@ odoo_login({
 
 | Herramienta | Descripción |
 |-------------|-------------|
+| `odoo_login` | Inicia sesión con tus credenciales de Odoo y guarda la sesión local |
+| `odoo_session_status` | Verifica si hay credenciales cargadas, guardadas y verificadas en el proceso |
 | `odoo_whoami` | Muestra el usuario actual conectado |
+| `odoo_logout` | Limpia la sesión en memoria y en disco |
 | `odoo_get_projects` | Lista todos los proyectos activos |
 | `odoo_get_my_projects` | Lista los proyectos donde tenés tickets asignados |
 | `odoo_get_my_tasks` | Lista tus tareas (opcional: project_id, state) |
@@ -127,8 +130,21 @@ odoo_login({
 | `odoo_get_gitlab_status` | Verifica ramas y referencias de MR directamente en GitLab |
 | `odoo_update_task` | Edita asignados, descripción y estado/etapa de una tarea |
 | `odoo_get_task_gitlab_branches` | Ramas GitLab vinculadas a una tarea |
+| `odoo_gitlab_list_projects` | Busca repositorios GitLab disponibles en Odoo |
+| `odoo_gitlab_list_users` | Busca usuarios Odoo para asignar como reviewer/owner GitLab |
+| `odoo_gitlab_add_task_branch` | Agrega una fila GitLab en la tarea (con preview/confirmación) |
+| `odoo_gitlab_create_branch` | Crea la rama remota en GitLab desde Odoo (con preview/confirmación) |
+| `odoo_gitlab_create_merge_request` | Crea el Merge Request en GitLab tras verificar divergencia (con preview/confirmación) |
+| `odoo_get_knowledge_articles` | Lista y busca artículos de documentación en Odoo Knowledge |
+| `odoo_get_knowledge_article` | Lee contenido y metadatos de un artículo de Knowledge |
+| `odoo_create_knowledge_article` | Crea un artículo nuevo en Odoo Knowledge (workspace, privado o hijo) |
+| `odoo_update_knowledge_article` | Edita, mueve, bloquea/desbloquea o restaura un artículo de Knowledge |
+| `odoo_delete_knowledge_article` | Previsualiza o envía a la Papelera un artículo de Knowledge (`confirm: true`) |
 | `odoo_create_timesheet` | Carga horas en una tarea |
+| `odoo_create_timesheets_bulk` | Carga múltiples líneas de horas en una sola llamada |
 | `odoo_get_my_timesheets` | Lista tus horas cargadas con filtros por fecha/proyecto/tarea |
+| `odoo_update_timesheet` | Modifica una línea de horas existente propia |
+| `odoo_delete_timesheet` | Elimina una línea de horas propia por ID |
 
 ### 3. Ejemplos de uso
 

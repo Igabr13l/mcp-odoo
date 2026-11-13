@@ -435,6 +435,24 @@ test("odoo_get_my_timesheets paginates with a matching count domain", async () =
   });
 });
 
+test("odoo_get_my_timesheets uses read_group total_hours across paginated results", async () => {
+  const executeKw = makeExecuteKw({
+    "account.analytic.line.search_count": () => 12,
+    "account.analytic.line.read_group": () => [{ unit_amount: 27.5 }],
+    "account.analytic.line.search_read": () => [
+      { id: 3, date: "2026-03-01", unit_amount: 1, name: "c" },
+      { id: 2, date: "2026-03-01", unit_amount: 1, name: "b" },
+    ],
+  });
+  const result = await makeTools(executeKw).handlers.odoo_get_my_timesheets({
+    project_id: 7,
+    limit: 2,
+    offset: 8,
+  });
+  assert.equal(record(result.structuredContent).total_hours, 27.5);
+  assert.match(result.content[0].text, /Total hours: 27\.5/);
+});
+
 test("odoo_get_my_timesheets rejects invalid offsets", async () => {
   const { handlers } = makeTools(makeExecuteKw());
   for (const offset of [-1, 1.5, "bad"]) {

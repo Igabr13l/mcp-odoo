@@ -423,8 +423,14 @@ export function createTimesheetTools({
           domain.push(["task_id", "=", positiveInt(args.task_id, "task_id")]);
         }
 
-        const [totalCount, rows] = await Promise.all([
+        const [totalCount, aggregateRows, rows] = await Promise.all([
           executeKw<number>("account.analytic.line", "search_count", [domain]),
+          executeKw<OdooRecord[]>(
+            "account.analytic.line",
+            "read_group",
+            [domain, ["unit_amount:sum"], []],
+            { lazy: false },
+          ),
           executeKw<OdooRecord[]>("account.analytic.line", "search_read", [domain], {
             fields: [
               "id",
@@ -440,10 +446,15 @@ export function createTimesheetTools({
           }),
         ]);
 
-        const totalHours = (rows || []).reduce(
+        const pageHours = (rows || []).reduce(
           (acc, row) => acc + (Number(row.unit_amount) || 0),
           0,
         );
+        const aggregatedHours = aggregateRows?.[0]?.unit_amount;
+        const totalHours =
+          typeof aggregatedHours === "number" && Number.isFinite(aggregatedHours)
+            ? aggregatedHours
+            : pageHours;
         const lines = (rows || []).map((r) => {
           const project = referenceName(r.project_id) || "N/A";
           const task = referenceName(r.task_id) || "N/A";

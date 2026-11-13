@@ -70,7 +70,15 @@ export interface MergeRequestInspection {
 }
 
 export type GitRunner = (args: string[]) => Promise<{ stdout: string }>;
-export type InspectBranch = (row: GitLabBranchRow) => Promise<BranchInspection>;
+export type InspectBranch = (
+  row: GitLabBranchRow,
+  options?: {
+    git?: GitRunner;
+    makeTempDir?: () => Promise<string>;
+    removeTempDir?: (path: string) => Promise<unknown>;
+    env?: Environment;
+  },
+) => Promise<BranchInspection>;
 export type InspectMergeRequest = (
   link: unknown,
   options?: { fetchImpl?: FetchImplementation; env?: Environment },
@@ -83,19 +91,22 @@ function allowedGitLabHosts(env: Environment = process.env): string[] {
     .filter(Boolean);
 }
 
-function gitTimeoutMs() {
-  const configured = Number(process.env.ODOO_GIT_TIMEOUT_MS);
+function gitTimeoutMs(env: Environment = process.env) {
+  const configured = Number(env.ODOO_GIT_TIMEOUT_MS);
   return Number.isFinite(configured) && configured > 0
     ? configured
     : DEFAULT_GIT_TIMEOUT_MS;
 }
 
-async function runGit(args: string[]): Promise<{ stdout: string }> {
+async function runGit(
+  args: string[],
+  env: Environment = process.env,
+): Promise<{ stdout: string }> {
   return execFileAsync("git", args, {
-    timeout: gitTimeoutMs(),
+    timeout: gitTimeoutMs(env),
     maxBuffer: 1024 * 1024,
     env: {
-      ...process.env,
+      ...env,
       GIT_TERMINAL_PROMPT: "0",
       GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o LogLevel=ERROR",
     },
@@ -107,9 +118,12 @@ export function normalizeMergeRequestLink(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-export function remoteFromLink(link: string): string {
+export function remoteFromLink(
+  link: string,
+  env: Environment = process.env,
+): string {
   const url = new URL(link);
-  if (!allowedGitLabHosts().includes(url.hostname.toLowerCase())) {
+  if (!allowedGitLabHosts(env).includes(url.hostname.toLowerCase())) {
     throw new Error(`GitLab host '${url.hostname}' is not allowed`);
   }
   const projectPath = url.pathname.split("/-/")[0].replace(/^\//, "");
@@ -301,11 +315,13 @@ function parseRemoteRefs(stdout: string): Map<string, string> {
 export async function inspectGitLabBranch(
   row: GitLabBranchRow,
   {
-    git = runGit,
+    env = process.env,
+    git = (args: string[]) => runGit(args, env),
     makeTempDir = () => mkdtemp(join(tmpdir(), "mcp-odoo-git-")),
     removeTempDir = (path: string) =>
       rm(path, { recursive: true, force: true }),
   }: {
+    env?: Environment;
     git?: GitRunner;
     makeTempDir?: () => Promise<string>;
     removeTempDir?: (path: string) => Promise<unknown>;
@@ -315,7 +331,7 @@ export async function inspectGitLabBranch(
     return { branch_exists: false, mr_ref_exists: false, status: "not_created" };
   }
 
-  const remote = remoteFromLink(String(row.gitlab_link));
+  const remote = remoteFromLink(String(row.gitlab_link), env);
   const branchRef = `refs/heads/${row.gitlab_branch_name}`;
   const targetRef = `refs/heads/${row.target_branch}`;
   const mergeRequestLink = normalizeMergeRequestLink(row.merge_request_link);
@@ -489,7 +505,7 @@ export function createGitLabStatusTools({
         for (const row of rows) {
           let branchStatus;
           try {
-            branchStatus = await inspectBranch(row);
+            branchStatus = await inspectBranch(row, { env });
           } catch (error) {
             branchStatus = {
               status: "verification_error",

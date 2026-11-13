@@ -480,9 +480,10 @@ export function createTicketContentTools({
           executeKw,
           taskIdFrom(args),
         );
-        const attachmentId = args.attachment_id
-          ? Number(args.attachment_id)
-          : null;
+        const attachmentId =
+          args.attachment_id === undefined
+            ? null
+            : positiveInt(args.attachment_id, "attachment_id");
         const video = attachments.find(
           (attachment) =>
             typeof attachment.mimetype === "string" &&

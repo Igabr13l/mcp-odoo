@@ -1,0 +1,27 @@
+schema: spec-driven
+
+context: |
+  Language: Spanish
+  All artifacts must be written in Spanish.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  Repo: mcp-odoo (authoritative standalone MCP server for Odoo).
+  Tech stack:
+  - TypeScript (ES2022, NodeNext ESM) compiled to dist/
+  - @modelcontextprotocol/sdk over stdio
+  - Node.js built-in test runner (node --test on compiled dist/test/*.test.js)
+  - Odoo JSON-RPC (/jsonrpc)
+
+  Convenciones:
+  - Herramientas MCP agrupadas en src/tools/*.ts usando defineToolGroup.
+  - Lecturas seguras con filtrado de permisos y enmascaramiento de secretos (redactSecrets).
+  - Mutaciones destructivas o sensibles requieren confirm=true con modo preview.
+  - Tests unitarios determinísticos offline con mocks en test/*.test.ts.
+
+rules:
+  specs:
+    - 'Use strict IDs: REQ-<DOMAIN>-<NUM> for requirements and SCN-<DOMAIN>-<NUM> for BDD scenarios.'
+    - 'Every requirement MUST have at least one scenario using exactly "#### Scenario: SCN-...".'
+    - Use SHALL and MUST for normative requirements (RFC 2119).
+  tasks:
+    - 'Format every task as a checkbox: "- [x] X.Y Task description" when completed.'

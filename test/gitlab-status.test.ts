@@ -59,6 +59,12 @@ test("remoteFromLink accepts configured GitLab hosts", () => {
     remoteFromLink("https://gitlab.solunika.com/group/project/-/tree/main"),
     "git@gitlab.solunika.com:group/project.git",
   );
+  assert.equal(
+    remoteFromLink("https://git.custom.example/group/project/-/tree/main", {
+      ODOO_GITLAB_ALLOWED_HOSTS: "git.custom.example",
+    }),
+    "git@git.custom.example:group/project.git",
+  );
 });
 
 test("remoteFromLink rejects untrusted hosts", () => {

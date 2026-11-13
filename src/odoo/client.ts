@@ -62,6 +62,11 @@ export class OdooRequestError extends Error {
   }
 }
 
+function normalizeBaseUrl(url: string | undefined): string | undefined {
+  const trimmed = url?.trim();
+  return trimmed ? trimmed.replace(/\/+$/, "") : undefined;
+}
+
 function requestTimeout(value: unknown): number {
   return Math.max(1000, Math.min(120000, Number(value) || DEFAULT_TIMEOUT_MS));
 }
@@ -192,7 +197,7 @@ export function createOdooClient({
     verified: boolean;
     sessionLoaded: boolean;
   } = {
-    url: env.ODOO_URL,
+    url: normalizeBaseUrl(env.ODOO_URL),
     db: env.ODOO_DB,
     uid: null,
     login: null,
@@ -303,7 +308,7 @@ export function createOdooClient({
             await readFile(sessionFile, "utf8"),
           ) as Partial<typeof state>;
           if (!parsed?.login || !parsed?.password) return;
-          state.url = parsed.url || state.url;
+          state.url = normalizeBaseUrl(parsed.url) || state.url;
           state.db = parsed.db || state.db;
           state.uid = parsed.uid || null;
           state.login = parsed.login;
@@ -461,7 +466,7 @@ export function createOdooClient({
   }: AuthenticateArguments) {
     await loadPersistedSession();
     const generation = sessionGeneration;
-    const nextUrl = url ? url.replace(/\/$/, "") : state.url;
+    const nextUrl = url ? normalizeBaseUrl(url) : state.url;
     const nextDb = db || state.db;
     if (!nextUrl || !nextDb) throw new Error("Odoo URL and database are required");
     const uid = await commonAuthenticate(nextUrl, nextDb, login, password);

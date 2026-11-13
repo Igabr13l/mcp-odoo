@@ -382,3 +382,36 @@ test("missing authentication has stable classified properties", async () => {
     return true;
   });
 });
+
+test("normalizes trailing slashes from ODOO_URL and persisted session URL", async () => {
+  const requestedUrls: string[] = [];
+  const directory = await mkdtemp(join(tmpdir(), "mcp-odoo-url-"));
+  const sessionFile = join(directory, "session.json");
+  await writeFile(
+    sessionFile,
+    JSON.stringify({
+      url: "https://odoo.example///",
+      db: "test",
+      uid: 16,
+      login: "user@example.com",
+      password: "secret-password",
+    }),
+  );
+  const client = createOdooClient({
+    env: {
+      ODOO_SESSION_FILE: sessionFile,
+      ODOO_URL: "https://fallback.example/",
+    },
+    fetchImpl: async (url) => {
+      requestedUrls.push(url);
+      return jsonResponse({ result: [] });
+    },
+  });
+  try {
+    await client.executeKw("res.users", "read", [[16]]);
+    assert.deepEqual(requestedUrls, ["https://odoo.example/jsonrpc"]);
+    assert.equal((await client.getSession()).url, "https://odoo.example");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

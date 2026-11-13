@@ -164,3 +164,20 @@ test("attachment metadata normalizer secures video metadata and excludes binary 
     /video-secret|url-secret|binary-secret|video-filename-secret/,
   );
 });
+
+test("odoo_get_ticket_video_frames validates attachment_id as positive integer", async () => {
+  await assert.rejects(
+    makeTools().handlers.odoo_get_ticket_video_frames({
+      task_id: 7,
+      attachment_id: 0,
+    }),
+    /attachment_id must be a positive integer/,
+  );
+  await assert.rejects(
+    makeTools().handlers.odoo_get_ticket_video_frames({
+      task_id: 7,
+      attachment_id: "abc",
+    }),
+    /attachment_id must be a positive integer/,
+  );
+});
