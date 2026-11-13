@@ -7,6 +7,9 @@
 | `REQ-KNOWLEDGE-003` (`SCN-KNOWLEDGE-007..008`) | `test/knowledge.test.ts` (`odoo_create_knowledge_article`, `normalizeArticleBody`) | `npm test` |
 | `REQ-KNOWLEDGE-004` (`SCN-KNOWLEDGE-009..010`) | `test/knowledge.test.ts` (`odoo_update_knowledge_article`) | `npm test` |
 | `REQ-KNOWLEDGE-005` (`SCN-KNOWLEDGE-011..012`) | `test/knowledge.test.ts` (`odoo_delete_knowledge_article`) | `npm test` |
+| `REQ-KNOWLEDGE-006` (`SCN-KNOWLEDGE-013`) | `test/knowledge-extras.test.ts` (`odoo_get_knowledge_stages`) | `npm test` |
+| `REQ-KNOWLEDGE-007` (`SCN-KNOWLEDGE-014`) | `test/knowledge-extras.test.ts` (`odoo_get_knowledge_article_attachments`, `odoo_get_knowledge_article_images`, `odoo_add_knowledge_attachment`) | `npm test` |
+| `REQ-KNOWLEDGE-008` (`SCN-KNOWLEDGE-015`) | `test/knowledge-extras.test.ts` (`odoo_get_knowledge_article_comments`, `odoo_add_knowledge_comment`) | `npm test` |
 | `REQ-CLIENT-001` (`SCN-CLIENT-001`) | `test/client.test.ts` (`normalizes trailing slashes...`) | `npm test` |
 | `REQ-TIMESHEET-001` (`SCN-TIMESHEET-001`) | `test/timesheets.test.ts` (`uses read_group total_hours...`) | `npm test` |
 | `REQ-GITLAB-001` (`SCN-GITLAB-001`) | `test/gitlab-status.test.ts` (`remoteFromLink accepts configured GitLab hosts`) | `npm test` |

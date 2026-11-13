@@ -11,6 +11,7 @@ import {
   defineToolGroup,
   errorMessage,
   executeKw as execute,
+  isRecord,
   referenceId,
   referenceName,
 } from "../contracts.js";
@@ -32,7 +33,10 @@ const SUMMARY_FIELDS = [
   "to_delete",
   "is_locked",
   "is_article_item",
+  "stage_id",
   "has_article_children",
+  "is_user_favorite",
+  "is_published",
   "user_has_access",
   "user_has_write_access",
   "user_permission",
@@ -47,8 +51,11 @@ const DETAIL_FIELDS = [
   "parent_path",
   "child_ids",
   "full_width",
-  "is_published",
-  "is_user_favorite",
+  "website_published",
+  "can_publish",
+  "website_url",
+  "article_properties",
+  "article_properties_definition",
   "deletion_date",
   "inherited_permission",
   "inherited_permission_parent_id",
@@ -106,7 +113,10 @@ function normalizeArticleSummary(article: OdooRecord) {
     to_delete: article.to_delete === true,
     is_locked: article.is_locked === true,
     is_article_item: article.is_article_item === true,
+    stage: formatReference(article.stage_id),
     has_article_children: article.has_article_children === true,
+    is_user_favorite: article.is_user_favorite === true,
+    is_published: article.is_published === true,
     user_has_access: article.user_has_access !== false,
     user_has_write_access: article.user_has_write_access === true,
     user_permission:
@@ -129,10 +139,73 @@ function formatArticleSummaryLine(article: ReturnType<typeof normalizeArticleSum
     article.category || "unknown",
     parent,
     access,
+    article.is_article_item ? "item" : null,
+    article.stage ? `stage:${article.stage.name}` : null,
+    article.is_user_favorite ? "favorite" : null,
+    article.is_published ? "published" : null,
     article.is_locked ? "locked" : null,
     article.to_delete || !article.active ? "trashed" : null,
   ].filter(Boolean);
   return `[${article.id}] ${prefix}${article.name} | ${flags.join(" | ")}${article.article_url ? `\n   ${article.article_url}` : ""}`;
+}
+
+export function applyIncrementalBodyEdit({
+  currentBody,
+  appendBody,
+  prependBody,
+  replaceText,
+}: {
+  currentBody: string;
+  appendBody?: unknown;
+  prependBody?: unknown;
+  replaceText?: unknown;
+}): string {
+  if (appendBody !== undefined) {
+    if (typeof appendBody !== "string" || !appendBody.trim()) {
+      throw new Error("append_body must be a nonblank string");
+    }
+    const chunk = normalizeArticleBody(appendBody);
+    return currentBody ? `${currentBody}${chunk}` : chunk;
+  }
+  if (prependBody !== undefined) {
+    if (typeof prependBody !== "string" || !prependBody.trim()) {
+      throw new Error("prepend_body must be a nonblank string");
+    }
+    const chunk = normalizeArticleBody(prependBody);
+    return currentBody ? `${chunk}${currentBody}` : chunk;
+  }
+  if (!isRecord(replaceText) || Array.isArray(replaceText)) {
+    throw new Error("replace_text must be an object with find and replace");
+  }
+  const { find, replace, replace_all: replaceAll } = replaceText;
+  if (typeof find !== "string" || !find) {
+    throw new Error("replace_text.find must be a non-empty string");
+  }
+  if (typeof replace !== "string") {
+    throw new Error("replace_text.replace must be a string");
+  }
+  if (find === replace) {
+    throw new Error("replace_text.replace must differ from replace_text.find");
+  }
+  const matches = currentBody.split(find).length - 1;
+  if (matches === 0) {
+    throw new Error(`Text not found in article body: ${JSON.stringify(find)}`);
+  }
+  if (matches > 1 && replaceAll !== true) {
+    throw new Error(
+      `Found ${matches} occurrences in article body; set replace_all=true to replace all`,
+    );
+  }
+  return replaceAll === true
+    ? currentBody.replaceAll(find, replace)
+    : currentBody.replace(find, replace);
+}
+
+function validateArticleProperties(value: unknown): Record<string, unknown> {
+  if (!isRecord(value) || Array.isArray(value)) {
+    throw new Error("article_properties must be an object mapping property names to values");
+  }
+  return value;
 }
 
 function definitions(): Tool[] {
@@ -160,6 +233,18 @@ function definitions(): Tool[] {
           include_items: {
             type: "boolean",
             description: "Include article database items (default true)",
+          },
+          items_only: {
+            type: "boolean",
+            description: "Only return article database/Kanban items",
+          },
+          favorites_only: {
+            type: "boolean",
+            description: "Only return articles marked as favorites",
+          },
+          stage_id: {
+            type: "number",
+            description: "Filter item articles by Kanban stage ID",
           },
           limit: {
             type: "number",
@@ -219,6 +304,26 @@ function definitions(): Tool[] {
           full_width: { type: "boolean", description: "Full width layout (optional)" },
           is_locked: { type: "boolean", description: "Lock article content (optional)" },
           sequence: { type: "number", description: "Ordering sequence (optional)" },
+          is_article_item: {
+            type: "boolean",
+            description: "Create as an item inside parent article (requires parent_id)",
+          },
+          stage_id: {
+            type: "number",
+            description: "Kanban stage ID (from odoo_get_knowledge_stages)",
+          },
+          article_properties: {
+            type: "object",
+            description: "Item property values keyed by property internal name",
+          },
+          is_published: {
+            type: "boolean",
+            description: "Publish article to website (optional)",
+          },
+          is_favorite: {
+            type: "boolean",
+            description: "Mark newly created article as favorite (optional)",
+          },
         },
         required: ["name"],
       },
@@ -231,7 +336,28 @@ function definitions(): Tool[] {
         properties: {
           article_id: { type: "number", description: "Knowledge article ID" },
           name: { type: "string", description: "New article title" },
-          body: { type: "string", description: "New article body (HTML or plain text)" },
+          body: { type: "string", description: "Replace entire article body (HTML or plain text)" },
+          append_body: {
+            type: "string",
+            description: "Append HTML or plain text to the end of the existing body",
+          },
+          prepend_body: {
+            type: "string",
+            description: "Prepend HTML or plain text to the start of the existing body",
+          },
+          replace_text: {
+            type: "object",
+            description: "Replace exact text/HTML inside the existing body",
+            properties: {
+              find: { type: "string", description: "Exact substring to find" },
+              replace: { type: "string", description: "Replacement text/HTML" },
+              replace_all: {
+                type: "boolean",
+                description: "Replace every occurrence (default false)",
+              },
+            },
+            required: ["find", "replace"],
+          },
           icon: {
             type: ["string", "null"],
             description: "Emoji icon (pass empty string or null to clear)",
@@ -247,6 +373,23 @@ function definitions(): Tool[] {
             description: "Internal permission: write | read | none",
           },
           sequence: { type: "number", description: "Ordering sequence" },
+          is_article_item: { type: "boolean", description: "Toggle item mode" },
+          stage_id: {
+            type: ["number", "null"],
+            description: "Kanban stage ID (pass null or 0 to clear)",
+          },
+          article_properties: {
+            type: "object",
+            description: "Item property values keyed by property internal name",
+          },
+          is_published: {
+            type: "boolean",
+            description: "Publish or unpublish article on website",
+          },
+          is_favorite: {
+            type: "boolean",
+            description: "Add or remove article from your favorites",
+          },
           restore: {
             type: "boolean",
             description: "Set true to restore a trashed article",
@@ -338,8 +481,19 @@ export function createKnowledgeTools({
         if (!includeTrashed) {
           domain.push(["active", "=", true]);
         }
-        if (args.include_items === false && filterFields.includes("is_article_item")) {
+        if (args.items_only === true && filterFields.includes("is_article_item")) {
+          domain.push(["is_article_item", "=", true]);
+        } else if (
+          args.include_items === false &&
+          filterFields.includes("is_article_item")
+        ) {
           domain.push(["is_article_item", "=", false]);
+        }
+        if (args.favorites_only === true) {
+          domain.push(["is_user_favorite", "=", true]);
+        }
+        if (args.stage_id !== undefined) {
+          domain.push(["stage_id", "=", positiveInt(args.stage_id, "stage_id")]);
         }
         if (args.category !== undefined) {
           const category = String(args.category);
@@ -438,8 +592,17 @@ export function createKnowledgeTools({
           body_html: safeHtml,
           parent_path: typeof row.parent_path === "string" ? row.parent_path : null,
           full_width: row.full_width === true,
-          is_published: row.is_published === true,
-          is_user_favorite: row.is_user_favorite === true,
+          website_published: row.website_published === true,
+          can_publish: row.can_publish === true,
+          website_url: typeof row.website_url === "string" ? row.website_url : null,
+          article_properties: Array.isArray(row.article_properties)
+            ? row.article_properties
+            : [],
+          article_properties_definition: Array.isArray(
+            row.article_properties_definition,
+          )
+            ? row.article_properties_definition
+            : [],
           deletion_date:
             typeof row.deletion_date === "string" ? row.deletion_date : null,
           inherited_permission:
@@ -458,8 +621,8 @@ export function createKnowledgeTools({
 
         const header = [
           `Article #${article.id}: ${article.icon ? `${article.icon} ` : ""}${article.name}`,
-          `Category: ${article.category || "N/A"} | Access: ${article.user_has_write_access ? "write" : "read"} | Locked: ${article.is_locked}`,
-          `Parent: ${article.parent ? `[${article.parent.id}] ${article.parent.name}` : "root"}`,
+          `Category: ${article.category || "N/A"} | Access: ${article.user_has_write_access ? "write" : "read"} | Locked: ${article.is_locked} | Favorite: ${article.is_user_favorite} | Published: ${article.is_published}`,
+          `Parent: ${article.parent ? `[${article.parent.id}] ${article.parent.name}` : "root"}${article.stage ? ` | Stage: [${article.stage.id}] ${article.stage.name}` : ""}`,
           `URL: ${article.article_url || "N/A"}`,
           children.length
             ? `Children (${children.length}): ${children.map((c) => `[${c.id}] ${c.name}`).join(", ")}`
@@ -577,6 +740,23 @@ export function createKnowledgeTools({
         if (args.sequence !== undefined) {
           values.sequence = nonnegativeInt(args.sequence, "sequence");
         }
+        if (args.is_article_item !== undefined) {
+          if (args.is_article_item === true && parentId === null) {
+            throw new Error("is_article_item=true requires parent_id");
+          }
+          values.is_article_item = Boolean(args.is_article_item);
+        }
+        if (args.stage_id !== undefined) {
+          values.stage_id = positiveInt(args.stage_id, "stage_id");
+        }
+        if (args.article_properties !== undefined) {
+          values.article_properties = validateArticleProperties(
+            args.article_properties,
+          );
+        }
+        if (args.is_published !== undefined) {
+          values.is_published = Boolean(args.is_published);
+        }
 
         const articleId = await executeKw<number>(
           "knowledge.article",
@@ -585,6 +765,9 @@ export function createKnowledgeTools({
         );
         if (!articleId) {
           throw new Error("Odoo did not create the Knowledge article");
+        }
+        if (args.is_favorite === true) {
+          await executeKw("knowledge.article", "action_toggle_favorite", [[articleId]]);
         }
 
         let created: ReturnType<typeof normalizeArticleSummary> | null = null;
@@ -617,7 +800,28 @@ export function createKnowledgeTools({
 
       async odoo_update_knowledge_article(args) {
         const articleId = positiveInt(args.article_id, "article_id");
-        const current = await readArticleById(articleId, SUMMARY_FIELDS);
+        const bodyEditModes = [
+          args.body !== undefined ? "body" : null,
+          args.append_body !== undefined ? "append_body" : null,
+          args.prepend_body !== undefined ? "prepend_body" : null,
+          args.replace_text !== undefined ? "replace_text" : null,
+        ].filter(Boolean);
+        if (bodyEditModes.length > 1) {
+          throw new Error(
+            `Only one body edit mode can be used at once (received: ${bodyEditModes.join(", ")})`,
+          );
+        }
+
+        const needsCurrentBody =
+          args.append_body !== undefined ||
+          args.prepend_body !== undefined ||
+          args.replace_text !== undefined;
+        const current = await readArticleById(
+          articleId,
+          needsCurrentBody
+            ? [...SUMMARY_FIELDS, "body", "can_publish"]
+            : [...SUMMARY_FIELDS, "can_publish"],
+        );
         if (!current) {
           throw new Error(`Article not found: ${articleId}`);
         }
@@ -639,6 +843,13 @@ export function createKnowledgeTools({
             throw new Error("body must be a string");
           }
           values.body = normalizeArticleBody(args.body);
+        } else if (needsCurrentBody) {
+          values.body = applyIncrementalBodyEdit({
+            currentBody: typeof current.body === "string" ? current.body : "",
+            appendBody: args.append_body,
+            prependBody: args.prepend_body,
+            replaceText: args.replace_text,
+          });
         }
         if (args.icon !== undefined) {
           values.icon = typeof args.icon === "string" && args.icon.trim()
@@ -691,11 +902,40 @@ export function createKnowledgeTools({
         if (args.sequence !== undefined) {
           values.sequence = nonnegativeInt(args.sequence, "sequence");
         }
+        if (args.is_article_item !== undefined) {
+          values.is_article_item = Boolean(args.is_article_item);
+        }
+        if (args.stage_id !== undefined) {
+          values.stage_id =
+            args.stage_id === null || args.stage_id === 0
+              ? false
+              : positiveInt(args.stage_id, "stage_id");
+        }
+        if (args.article_properties !== undefined) {
+          values.article_properties = validateArticleProperties(
+            args.article_properties,
+          );
+        }
+        if (args.is_published !== undefined) {
+          if (current.can_publish === false) {
+            throw new Error(
+              `You do not have permission to publish Knowledge article ${articleId}`,
+            );
+          }
+          values.is_published = Boolean(args.is_published);
+        }
 
         const shouldRestore = args.restore === true &&
           (current.active === false || current.to_delete === true);
+        const shouldToggleFavorite =
+          args.is_favorite !== undefined &&
+          Boolean(args.is_favorite) !== Boolean(current.is_user_favorite);
 
-        if (Object.keys(values).length === 0 && !shouldRestore) {
+        if (
+          Object.keys(values).length === 0 &&
+          !shouldRestore &&
+          !shouldToggleFavorite
+        ) {
           return {
             content: [{ type: "text", text: "Nothing to update" }],
             structuredContent: { id: articleId, updated: false },
@@ -740,6 +980,10 @@ export function createKnowledgeTools({
           }
         }
 
+        if (shouldToggleFavorite) {
+          await executeKw("knowledge.article", "action_toggle_favorite", [[articleId]]);
+        }
+
         let updated: ReturnType<typeof normalizeArticleSummary> | null = null;
         let verificationError: string | null = null;
         try {
@@ -762,6 +1006,7 @@ export function createKnowledgeTools({
             id: articleId,
             updated: true,
             restored: shouldRestore,
+            favorite_toggled: shouldToggleFavorite,
             verified: verificationError === null,
             article: updated,
             verification_error: verificationError,

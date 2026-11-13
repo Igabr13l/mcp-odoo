@@ -135,11 +135,17 @@ odoo_login({
 | `odoo_gitlab_add_task_branch` | Agrega una fila GitLab en la tarea (con preview/confirmación) |
 | `odoo_gitlab_create_branch` | Crea la rama remota en GitLab desde Odoo (con preview/confirmación) |
 | `odoo_gitlab_create_merge_request` | Crea el Merge Request en GitLab tras verificar divergencia (con preview/confirmación) |
-| `odoo_get_knowledge_articles` | Lista y busca artículos de documentación en Odoo Knowledge |
-| `odoo_get_knowledge_article` | Lee contenido y metadatos de un artículo de Knowledge |
-| `odoo_create_knowledge_article` | Crea un artículo nuevo en Odoo Knowledge (workspace, privado o hijo) |
-| `odoo_update_knowledge_article` | Edita, mueve, bloquea/desbloquea o restaura un artículo de Knowledge |
+| `odoo_get_knowledge_articles` | Lista y busca artículos de documentación en Odoo Knowledge (filtros por sección, padre, favoritos, ítems, etapa, papelera) |
+| `odoo_get_knowledge_article` | Lee contenido y metadatos de un artículo de Knowledge (incluye propiedades, etapa, favorito, publicación web e hijos) |
+| `odoo_create_knowledge_article` | Crea un artículo nuevo en Odoo Knowledge (workspace, privado, hijo o ítem Kanban) |
+| `odoo_update_knowledge_article` | Edita título, cuerpo (`body`, `append_body`, `prepend_body`, `replace_text`), icono, padre, favorito, publicación, etapa/propiedades o restaura |
 | `odoo_delete_knowledge_article` | Previsualiza o envía a la Papelera un artículo de Knowledge (`confirm: true`) |
+| `odoo_get_knowledge_stages` | Lista etapas Kanban (`knowledge.article.stage`) y definición de propiedades de un artículo padre |
+| `odoo_get_knowledge_article_attachments` | Lista adjuntos vinculados al artículo, sus hilos de comentarios y chatter |
+| `odoo_get_knowledge_article_images` | Devuelve imágenes adjuntas del artículo como contenido visual MCP |
+| `odoo_add_knowledge_attachment` | Adjunta un archivo (base64) o URL externa a un artículo de Knowledge |
+| `odoo_get_knowledge_article_comments` | Lee hilos de comentarios anclados (`knowledge.article.thread`) y mensajes del chatter del artículo |
+| `odoo_add_knowledge_comment` | Previsualiza, publica o resuelve un comentario/nota en un artículo o hilo de Knowledge (`confirm: true`) |
 | `odoo_create_timesheet` | Carga horas en una tarea |
 | `odoo_create_timesheets_bulk` | Carga múltiples líneas de horas en una sola llamada |
 | `odoo_get_my_timesheets` | Lista tus horas cargadas con filtros por fecha/proyecto/tarea |

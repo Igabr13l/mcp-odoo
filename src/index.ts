@@ -12,6 +12,7 @@ import { createBoardTools } from "./tools/board.js";
 import { createGitLabTools } from "./tools/gitlab.js";
 import { createGitLabStatusTools } from "./tools/gitlab-status.js";
 import { createKnowledgeTools } from "./tools/knowledge.js";
+import { createKnowledgeExtrasTools } from "./tools/knowledge-extras.js";
 import { createProjectTools } from "./tools/projects.js";
 import { createSessionTools } from "./tools/session.js";
 import { createTaskTools } from "./tools/tasks.js";
@@ -37,6 +38,7 @@ const toolGroups = [
   createGitLabTools(dependencies),
   createGitLabStatusTools(dependencies),
   createKnowledgeTools(dependencies),
+  createKnowledgeExtrasTools(dependencies),
   createTimesheetTools(dependencies),
 ];
 

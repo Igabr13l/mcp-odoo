@@ -566,3 +566,153 @@ test("odoo_delete_knowledge_article rejects locked or readonly articles", async 
     /do not have write access/,
   );
 });
+
+test("odoo_update_knowledge_article supports append_body, prepend_body, and replace_text", async () => {
+  const appendKw = makeExecuteKw({
+    "knowledge.article.read": () => [
+      { id: 497, name: "Doc", body: "<p>Initial</p>", user_has_write_access: true },
+    ],
+  });
+  await makeTools(appendKw).handlers.odoo_update_knowledge_article({
+    article_id: 497,
+    append_body: "Appended line",
+  });
+  const appendWrite = required(
+    appendKw.calls.find((c) => c.key === "knowledge.article.write"),
+  );
+  assert.deepEqual(appendWrite.args, [[497], { body: "<p>Initial</p><p>Appended line</p>" }]);
+
+  const prependKw = makeExecuteKw({
+    "knowledge.article.read": () => [
+      { id: 497, name: "Doc", body: "<p>Initial</p>", user_has_write_access: true },
+    ],
+  });
+  await makeTools(prependKw).handlers.odoo_update_knowledge_article({
+    article_id: 497,
+    prepend_body: "<h1>Header</h1>",
+  });
+  const prependWrite = required(
+    prependKw.calls.find((c) => c.key === "knowledge.article.write"),
+  );
+  assert.deepEqual(prependWrite.args, [[497], { body: "<h1>Header</h1><p>Initial</p>" }]);
+
+  const replaceKw = makeExecuteKw({
+    "knowledge.article.read": () => [
+      { id: 497, name: "Doc", body: "<p>foo and foo</p>", user_has_write_access: true },
+    ],
+  });
+  await assert.rejects(
+    makeTools(replaceKw).handlers.odoo_update_knowledge_article({
+      article_id: 497,
+      replace_text: { find: "foo", replace: "bar" },
+    }),
+    /Found 2 occurrences/,
+  );
+  await makeTools(replaceKw).handlers.odoo_update_knowledge_article({
+    article_id: 497,
+    replace_text: { find: "foo", replace: "bar", replace_all: true },
+  });
+  const replaceWrite = required(
+    replaceKw.calls.find((c) => c.key === "knowledge.article.write"),
+  );
+  assert.deepEqual(replaceWrite.args, [[497], { body: "<p>bar and bar</p>" }]);
+
+  await assert.rejects(
+    makeTools(replaceKw).handlers.odoo_update_knowledge_article({
+      article_id: 497,
+      body: "<p>x</p>",
+      append_body: "y",
+    }),
+    /Only one body edit mode/,
+  );
+});
+
+test("odoo_create_knowledge_article and update support favorites, publishing, items, stages, and properties", async () => {
+  const executeKw = makeExecuteKw();
+  const { handlers } = makeTools(executeKw);
+
+  await assert.rejects(
+    handlers.odoo_create_knowledge_article({ name: "Item", is_article_item: true }),
+    /requires parent_id/,
+  );
+
+  await handlers.odoo_create_knowledge_article({
+    name: "Release v51",
+    parent_id: 142,
+    is_article_item: true,
+    stage_id: 10,
+    article_properties: { deadline: "2026-12-01" },
+    is_published: true,
+    is_favorite: true,
+  });
+  const createCall = required(
+    executeKw.calls.find((c) => c.key === "knowledge.article.create"),
+  );
+  assert.deepEqual(createCall.args[0], {
+    name: "Release v51",
+    parent_id: 142,
+    is_article_item: true,
+    stage_id: 10,
+    article_properties: { deadline: "2026-12-01" },
+    is_published: true,
+  });
+  assert.ok(
+    executeKw.calls.some((c) => c.key === "knowledge.article.action_toggle_favorite"),
+  );
+
+  const noPublishKw = makeExecuteKw({
+    "knowledge.article.read": () => [
+      { id: 10, name: "Doc", user_has_write_access: true, can_publish: false },
+    ],
+  });
+  await assert.rejects(
+    makeTools(noPublishKw).handlers.odoo_update_knowledge_article({
+      article_id: 10,
+      is_published: true,
+    }),
+    /do not have permission to publish/,
+  );
+
+  const favKw = makeExecuteKw({
+    "knowledge.article.read": () => [
+      {
+        id: 10,
+        name: "Doc",
+        user_has_write_access: true,
+        is_user_favorite: false,
+        can_publish: true,
+      },
+    ],
+  });
+  const updated = await makeTools(favKw).handlers.odoo_update_knowledge_article({
+    article_id: 10,
+    is_favorite: true,
+    is_published: true,
+    stage_id: 11,
+    article_properties: { priority: "high_priority" },
+  });
+  assert.equal(structuredContent(updated).favorite_toggled, true);
+  assert.ok(
+    favKw.calls.some((c) => c.key === "knowledge.article.action_toggle_favorite"),
+  );
+});
+
+test("odoo_get_knowledge_articles supports favorites_only, items_only, and stage_id filters", async () => {
+  const executeKw = makeExecuteKw();
+  await makeTools(executeKw).handlers.odoo_get_knowledge_articles({
+    favorites_only: true,
+    items_only: true,
+    stage_id: 10,
+  });
+  const searchRead = required(
+    executeKw.calls.find((c) => c.key === "knowledge.article.search_read"),
+  );
+  assert.deepEqual(searchRead.args[0], [
+    ["is_template", "=", false],
+    ["user_has_access", "=", true],
+    ["active", "=", true],
+    ["is_article_item", "=", true],
+    ["is_user_favorite", "=", true],
+    ["stage_id", "=", 10],
+  ]);
+});
