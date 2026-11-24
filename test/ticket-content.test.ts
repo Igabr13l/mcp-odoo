@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile, rm } from "node:fs/promises";
 import test from "node:test";
 import type { ExecuteKwImplementation } from "../src/contracts.js";
 import {
@@ -179,5 +180,242 @@ test("odoo_get_ticket_video_frames validates attachment_id as positive integer",
       attachment_id: "abc",
     }),
     /attachment_id must be a positive integer/,
+  );
+});
+
+function makeGenericAttachmentTools({
+  attachment,
+  datas,
+}: {
+  attachment: {
+    id: number;
+    name: string;
+    mimetype: string;
+    file_size: number;
+  };
+  datas: string;
+}) {
+  const executeKw: ExecuteKwImplementation = async (
+    model,
+    method,
+    args = [],
+    kwargs = {},
+  ) => {
+    if (model === "mail.message" && method === "search_read") {
+      return [
+        {
+          id: 30,
+          date: "2026-10-22 17:08:09",
+          author_id: [4, "Santino"],
+          attachment_ids: [attachment.id],
+        },
+      ];
+    }
+    if (model === "ir.attachment" && method === "search_read") {
+      return [];
+    }
+    if (model === "ir.attachment" && method === "read") {
+      if (array(args[1]).includes("datas")) {
+        return [
+          {
+            id: attachment.id,
+            name: attachment.name,
+            mimetype: attachment.mimetype,
+            file_size: attachment.file_size,
+            datas,
+          },
+        ];
+      }
+      return [
+        {
+          ...attachment,
+          type: "binary",
+          url: false,
+          description: false,
+          res_model: "mail.message",
+          res_id: 30,
+        },
+      ];
+    }
+    throw new Error(`Unexpected call ${model}.${method} ${JSON.stringify(kwargs)}`);
+  };
+  return createTicketContentTools({ executeKw });
+}
+
+test("odoo_get_ticket_attachment reads inline text with secret redaction and provenance", async () => {
+  const rawText = "token: inline-secret\nstatus=ok";
+  const tools = makeGenericAttachmentTools({
+    attachment: {
+      id: 70,
+      name: "debug.log",
+      mimetype: "text/plain",
+      file_size: Buffer.byteLength(rawText),
+    },
+    datas: Buffer.from(rawText, "utf8").toString("base64"),
+  });
+
+  const result = await tools.handlers.odoo_get_ticket_attachment({
+    task_id: 7,
+    attachment_id: 70,
+  });
+  const data = structuredContent<{
+    task_id: number;
+    text: string;
+    truncated: boolean;
+    redacted: boolean;
+    is_text: boolean;
+    attachment: AttachmentMetadata;
+  }>(result);
+
+  assert.equal(data.task_id, 7);
+  assert.equal(data.redacted, true);
+  assert.equal(data.is_text, true);
+  assert.equal(data.truncated, false);
+  assert.equal(data.text, "token: [REDACTED]\nstatus=ok");
+  assert.equal(required(data.attachment.provenance).source_messages[0].id, 30);
+  assert.match(textContent(result), /message:30 2026-10-22 17:08:09 Santino/);
+  assert.doesNotMatch(JSON.stringify(result), /inline-secret/);
+});
+
+test("odoo_get_ticket_attachment saves redacted valid JSON when save_to_temp is true for HAR files", async () => {
+  const harPayload = {
+    log: {
+      entries: [
+        {
+          request: {
+            url: "https://support-uat.hubeet.com/graphql",
+            headers: [
+              { name: "Authorization", value: "Bearer har-auth-secret" },
+              { name: "Cookie", value: "session_id=har-cookie-secret" },
+              { name: "Content-Type", value: "application/json" },
+            ],
+            cookies: [{ name: "sid", value: "har-sid-secret" }],
+            postData: {
+              text: JSON.stringify({
+                operationName: "getThreadMessagesCopilot",
+                variables: { threadUUID: "abc-123" },
+              }),
+            },
+          },
+          response: {
+            status: 200,
+            headers: [{ name: "Set-Cookie", value: "sid=har-set-cookie-secret" }],
+            cookies: [{ name: "csrf", value: "har-csrf-secret" }],
+          },
+        },
+      ],
+    },
+  };
+  const rawHar = JSON.stringify(harPayload);
+  const tools = makeGenericAttachmentTools({
+    attachment: {
+      id: 71,
+      name: "../capture.har",
+      mimetype: "text/plain",
+      file_size: Buffer.byteLength(rawHar),
+    },
+    datas: Buffer.from(rawHar, "utf8").toString("base64"),
+  });
+
+  const result = await tools.handlers.odoo_get_ticket_attachment({
+    task_id: 7,
+    attachment_id: 71,
+    save_to_temp: true,
+  });
+  const data = structuredContent<{
+    file_path: string;
+    redacted: boolean;
+    is_text: boolean;
+  }>(result);
+
+  try {
+    assert.equal(data.redacted, true);
+    assert.equal(data.is_text, true);
+    assert.match(data.file_path, /task-7-att-71-capture\.har$/);
+
+    const savedContent = await readFile(data.file_path, "utf8");
+    assert.doesNotMatch(
+      savedContent,
+      /har-auth-secret|har-cookie-secret|har-sid-secret|har-set-cookie-secret|har-csrf-secret/,
+    );
+
+    const parsed = JSON.parse(savedContent) as typeof harPayload;
+    const entry = parsed.log.entries[0];
+    assert.equal(entry.request.headers[0].value, "[REDACTED]");
+    assert.equal(entry.request.headers[1].value, "[REDACTED]");
+    assert.equal(entry.request.headers[2].value, "application/json");
+    assert.equal(entry.request.cookies[0].value, "[REDACTED]");
+    assert.equal(entry.response.status, 200);
+    assert.equal(entry.response.headers[0].value, "[REDACTED]");
+    assert.equal(entry.response.cookies[0].value, "[REDACTED]");
+    assert.match(entry.request.postData.text, /getThreadMessagesCopilot/);
+  } finally {
+    await rm(data.file_path, { force: true });
+  }
+});
+
+test("odoo_get_ticket_attachment truncates inline text when exceeding max_chars", async () => {
+  const rawText = "a".repeat(500);
+  const tools = makeGenericAttachmentTools({
+    attachment: {
+      id: 72,
+      name: "large.txt",
+      mimetype: "text/plain",
+      file_size: rawText.length,
+    },
+    datas: Buffer.from(rawText, "utf8").toString("base64"),
+  });
+
+  const result = await tools.handlers.odoo_get_ticket_attachment({
+    task_id: 7,
+    attachment_id: 72,
+    max_chars: 120,
+  });
+  const data = structuredContent<{
+    text: string;
+    total_chars: number;
+    truncated: boolean;
+  }>(result);
+
+  assert.equal(data.truncated, true);
+  assert.equal(data.total_chars, 500);
+  assert.equal(data.text.length, 120);
+  assert.match(textContent(result), /Pass save_to_temp: true/);
+});
+
+test("odoo_get_ticket_attachment enforces ownership, size limit, and binary guard", async () => {
+  const binaryTools = makeGenericAttachmentTools({
+    attachment: {
+      id: 73,
+      name: "archive.zip",
+      mimetype: "application/zip",
+      file_size: 4,
+    },
+    datas: Buffer.from([1, 2, 3, 4]).toString("base64"),
+  });
+
+  await assert.rejects(
+    binaryTools.handlers.odoo_get_ticket_attachment({
+      task_id: 7,
+      attachment_id: 999,
+    }),
+    /Attachment 999 not found on this ticket/,
+  );
+
+  await assert.rejects(
+    binaryTools.handlers.odoo_get_ticket_attachment({
+      task_id: 7,
+      attachment_id: 73,
+      max_bytes: 2,
+    }),
+    /Attachment exceeds the 2 byte limit/,
+  );
+
+  await assert.rejects(
+    binaryTools.handlers.odoo_get_ticket_attachment({
+      task_id: 7,
+      attachment_id: 73,
+    }),
+    /Attachment 73 is binary \(application\/zip\); pass save_to_temp: true/,
   );
 });

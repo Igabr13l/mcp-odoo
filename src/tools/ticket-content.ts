@@ -1,7 +1,7 @@
 import { formatList, htmlToText, redactSecrets } from "../utils/format.js";
 import { normalizeLimit, positiveInt } from "../utils/args.js";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -42,6 +42,23 @@ const SUPPORTED_VIDEO_TYPES = new Set([
   "video/quicktime",
   "video/webm",
 ]);
+const SUPPORTED_TEXT_APPLICATION_TYPES = new Set([
+  "application/json",
+  "application/har+json",
+  "application/xml",
+  "application/javascript",
+  "application/x-javascript",
+  "application/csv",
+  "application/x-ndjson",
+  "application/yaml",
+  "application/x-yaml",
+]);
+const TEXT_EXTENSIONS =
+  /\.(har|json|txt|log|csv|xml|md|yaml|yml|html|css|js|ts|sql)$/i;
+const SENSITIVE_HEADER_NAME_RE =
+  /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|api-key|apikey|token|session|sid|csrf|xsrf)/i;
+const SENSITIVE_JSON_KEY_RE =
+  /^(authorization|cookie|set-cookie|password|passwd|secret|token|access_token|refresh_token|id_token|api_key|apikey|private_key)$/i;
 
 interface SourceMessage {
   id: number | undefined;
@@ -222,6 +239,107 @@ function formatAttachment(attachment: AttachmentRecord): string {
   return `[${attachment.id}] ${metadata.name || "unnamed"} - ${kind} - ${attachment.mimetype || "unknown"} - ${size} bytes${source}\n   provenance: ${formatProvenance(attachment)}`;
 }
 
+function isTextAttachment(mimetype: unknown, name: unknown): boolean {
+  if (typeof mimetype === "string") {
+    const normalized = mimetype.split(";")[0].trim().toLowerCase();
+    if (
+      normalized.startsWith("text/") ||
+      SUPPORTED_TEXT_APPLICATION_TYPES.has(normalized)
+    ) {
+      return true;
+    }
+  }
+  return typeof name === "string" && TEXT_EXTENSIONS.test(name.trim());
+}
+
+function redactJsonValue(value: unknown, inCookiesArray = false): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactJsonValue(item, inCookiesArray));
+  }
+  if (typeof value === "string") {
+    return redactSecrets(value);
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const isSensitiveNameValuePair =
+      typeof obj.name === "string" &&
+      "value" in obj &&
+      (inCookiesArray || SENSITIVE_HEADER_NAME_RE.test(obj.name));
+
+    const result: Record<string, unknown> = {};
+    for (const [key, entryValue] of Object.entries(obj)) {
+      if (isSensitiveNameValuePair && key === "value") {
+        result[key] = "[REDACTED]";
+      } else if (SENSITIVE_JSON_KEY_RE.test(key)) {
+        result[key] = "[REDACTED]";
+      } else if (key === "cookies" && Array.isArray(entryValue)) {
+        result[key] = redactJsonValue(entryValue, true);
+      } else {
+        result[key] = redactJsonValue(entryValue, false);
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+function redactAttachmentText(
+  text: string,
+  mimetype: unknown,
+  name: unknown,
+): string {
+  const normalizedMime =
+    typeof mimetype === "string" ? mimetype.toLowerCase() : "";
+  const trimmed = text.trim();
+  const isJsonLike =
+    (typeof name === "string" && /\.(json|har)$/i.test(name.trim())) ||
+    normalizedMime.includes("json") ||
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[");
+
+  if (isJsonLike) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      return JSON.stringify(redactJsonValue(parsed), null, 2);
+    } catch {
+      return redactSecrets(text);
+    }
+  }
+  return redactSecrets(text);
+}
+
+function sanitizeAttachmentFilename(
+  name: unknown,
+  taskId: number,
+  attachmentId: number,
+): string {
+  const raw = typeof name === "string" ? name : "";
+  const base = raw.split(/[/\\]/).pop() || "";
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/^\.+/, "");
+  const safeBase = (cleaned || "attachment.bin").slice(0, 80);
+  return `task-${taskId}-att-${attachmentId}-${safeBase}`;
+}
+
+async function writeAttachmentTempFile(
+  name: unknown,
+  taskId: number,
+  attachmentId: number,
+  payload: string | Buffer,
+): Promise<string> {
+  const dir = join(tmpdir(), "odoo-mcp-attachments");
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const filePath = join(
+    dir,
+    sanitizeAttachmentFilename(name, taskId, attachmentId),
+  );
+  if (typeof payload === "string") {
+    await writeFile(filePath, payload, { encoding: "utf8", mode: 0o600 });
+  } else {
+    await writeFile(filePath, payload, { mode: 0o600 });
+  }
+  return filePath;
+}
+
 function videoExtension(mimetype: unknown): string {
   if (mimetype === "video/quicktime") return ".mov";
   if (mimetype === "video/webm") return ".webm";
@@ -364,6 +482,42 @@ function definitions(): Tool[] {
           },
         },
         required: ["task_id"],
+      },
+    },
+    {
+      name: "odoo_get_ticket_attachment",
+      description:
+        "Read or download a ticket attachment (text/JSON/HAR/logs inline or saved to a local temp file with secret redaction)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          task_id: { type: "number", description: "Task ID" },
+          attachment_id: {
+            type: "number",
+            description: "Attachment ID from odoo_get_ticket_attachments",
+          },
+          max_bytes: {
+            type: "number",
+            description:
+              "Maximum attachment size in bytes (default 10485760, max 26214400)",
+          },
+          max_chars: {
+            type: "number",
+            description:
+              "Maximum inline text characters when save_to_temp is false (default 20000, max 100000)",
+          },
+          save_to_temp: {
+            type: "boolean",
+            description:
+              "Save decoded attachment to a local temp file and return its path (default false)",
+          },
+          redact_secrets: {
+            type: "boolean",
+            description:
+              "Mask API keys, tokens, passwords, cookies and auth headers in text/JSON/HAR attachments (default true)",
+          },
+        },
+        required: ["task_id", "attachment_id"],
       },
     },
   ];
@@ -542,6 +696,135 @@ export function createTicketContentTools({
             video: normalizeAttachmentMetadata(video),
             duration_seconds: rendered.duration,
             frame_timestamps: rendered.frames.map((frame) => frame.timestamp),
+          },
+        };
+      },
+
+      async odoo_get_ticket_attachment(args) {
+        const taskId = taskIdFrom(args);
+        const attachmentId = positiveInt(args.attachment_id, "attachment_id");
+        const maxBytes = normalizeLimit(
+          args.max_bytes,
+          10 * 1024 * 1024,
+          25 * 1024 * 1024,
+        );
+        const maxChars = normalizeLimit(args.max_chars, 20000, 100000);
+        const saveToTemp = args.save_to_temp === true;
+        const redact = args.redact_secrets !== false;
+
+        const attachments = await getAttachmentRows(executeKw, taskId);
+        const attachment = attachments.find((item) => item.id === attachmentId);
+        if (!attachment) {
+          throw new Error(`Attachment ${attachmentId} not found on this ticket`);
+        }
+
+        if (Number(attachment.file_size || 0) > maxBytes) {
+          throw new Error(`Attachment exceeds the ${maxBytes} byte limit`);
+        }
+
+        const rows = await execute<AttachmentRecord[]>(
+          executeKw,
+          "ir.attachment",
+          "read",
+          [[attachment.id], ["id", "name", "mimetype", "file_size", "datas"]],
+        );
+        const row = rows?.[0];
+        if (typeof row?.datas !== "string" || !row.datas) {
+          throw new Error("Attachment content is not readable");
+        }
+
+        const buffer = Buffer.from(row.datas, "base64");
+        const effectiveMime = row.mimetype ?? attachment.mimetype;
+        const effectiveName = row.name ?? attachment.name;
+        const textReadable = isTextAttachment(effectiveMime, effectiveName);
+        const metadata = normalizeAttachmentMetadata(attachment);
+        const provenance = formatProvenance(attachment);
+
+        if (!textReadable) {
+          if (!saveToTemp) {
+            throw new Error(
+              `Attachment ${attachmentId} is binary (${String(effectiveMime || "application/octet-stream")}); pass save_to_temp: true to save it locally, or use odoo_get_ticket_images / odoo_get_ticket_video_frames for media`,
+            );
+          }
+          const filePath = await writeAttachmentTempFile(
+            effectiveName,
+            taskId,
+            attachmentId,
+            buffer,
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Attachment [${row.id}] ${metadata.name || "unnamed"} (${buffer.length} bytes, binary)\n   provenance: ${provenance}\n   file_path: ${filePath}\n   redacted: false`,
+              },
+            ],
+            structuredContent: {
+              task_id: taskId,
+              attachment: metadata,
+              file_path: filePath,
+              bytes: buffer.length,
+              redacted: false,
+              is_text: false,
+            },
+          };
+        }
+
+        const rawText = buffer.toString("utf8");
+        const outputText = redact
+          ? redactAttachmentText(rawText, effectiveMime, effectiveName)
+          : rawText;
+
+        if (saveToTemp) {
+          const filePath = await writeAttachmentTempFile(
+            effectiveName,
+            taskId,
+            attachmentId,
+            outputText,
+          );
+          const bytes = Buffer.byteLength(outputText, "utf8");
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Attachment [${row.id}] ${metadata.name || "unnamed"} (${bytes} bytes, ${outputText.length} chars)\n   provenance: ${provenance}\n   file_path: ${filePath}\n   redacted: ${String(redact)}`,
+              },
+            ],
+            structuredContent: {
+              task_id: taskId,
+              attachment: metadata,
+              file_path: filePath,
+              bytes,
+              chars: outputText.length,
+              redacted: redact,
+              is_text: true,
+            },
+          };
+        }
+
+        const snippet = outputText.slice(0, maxChars);
+        const truncated = outputText.length > maxChars;
+        const truncationNotice = truncated
+          ? `\n\n[Truncated: showing ${snippet.length} of ${outputText.length} chars. Pass save_to_temp: true to save the full attachment locally.]`
+          : "";
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Attachment [${row.id}] ${metadata.name || "unnamed"} (${Number(row.file_size || buffer.length)} bytes)\n   provenance: ${provenance}\n\n${snippet}${truncationNotice}`,
+            },
+          ],
+          structuredContent: {
+            task_id: taskId,
+            attachment: metadata,
+            text: snippet,
+            total_chars: outputText.length,
+            truncated,
+            redacted: redact,
+            is_text: true,
           },
         };
       },
